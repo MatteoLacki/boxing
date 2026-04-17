@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools >= 64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name="boxing"
+version="0.0.1"
+description="SHORT DESC."
+readme="README.md"
+authors=[
+    {name="MatteoLacki",email="matteo.lacki@gmail.com"},
+]
+requires-python = ">=3.6"
+# dependencies = [
+#     "click",
+# ]
+
+# [project.optional-dependencies]
+# dev = [
+#     "twine",
+#     "pytest",
+# ]
+
+
+[project.scripts]
+example_shell_script = "boxing.cli.example_shell_script:example_shell_script"
+
+[project.urls]
+homepage="https://github.com/MatteoLacki/boxing.git"
+repository="https://github.com/MatteoLacki/boxing.git"
+
+[tool.uv]
+reinstall-package = ["boxing"]
+
+# [tool.pytest.ini_options]
+# testpaths = ["tests"]
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# [tool.setuptools]
+# include-package-data = true
+
+# [tool.setuptools.package-data]
+# boxing = ["data/*.csv"]
