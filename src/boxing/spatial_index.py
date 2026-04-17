@@ -479,6 +479,7 @@ def _count_intersections_first_coordinate_left_side_parallel(
     xx_bucket_width: np.int64,
     yy_bucket_width: np.int64,
     progress: ProgressBar | None = None,
+    ellipsoid_radius: float = math.inf,
 ) -> NDArray:
     """Count 2D box-box intersections; prange over xx-buckets.
 
@@ -486,11 +487,17 @@ def _count_intersections_first_coordinate_left_side_parallel(
     box_order[idx] gives the original (unsorted) box index for sorted position idx.
 
     Returns counts[N] in sorted order; caller must unsort via counts[box_order] = counts_sorted.
+
+    ellipsoid_radius:
+        If finite, restrict pairs to those whose centre-to-centre distance (normalised
+        by the sum of each box's half-widths per axis) is <= ellipsoid_radius.
+        Pass 1.0 for the inscribed ellipsoid; default math.inf = full rectangle.
     """
     n_boxes = len(xx_lo)
     n_xx_buckets = len(row_starts) - 1
     n_yy_buckets = cell_offsets.shape[1] - 1
     counts = np.zeros(n_boxes, dtype=np.int32)
+    MAX_R2 = ellipsoid_radius * ellipsoid_radius
 
     for bx in numba.prange(n_xx_buckets):
         n_in_bx = xx_starts[bx + 1] - xx_starts[bx]
@@ -524,7 +531,13 @@ def _count_intersections_first_coordinate_left_side_parallel(
                                 continue
                         if (xx_lo[i] < xx_hi[j] and xx_lo[j] < xx_hi[i] and
                                 yy_lo[i] < yy_hi[j] and yy_lo[j] < yy_hi[i]):
-                            local_count += 1
+                            passes = True
+                            if MAX_R2 < math.inf:
+                                d_xx = (xx_lo[i] + xx_hi[i] - xx_lo[j] - xx_hi[j]) / (xx_hi[i] - xx_lo[i] + xx_hi[j] - xx_lo[j])
+                                d_yy = (yy_lo[i] + yy_hi[i] - yy_lo[j] - yy_hi[j]) / (yy_hi[i] - yy_lo[i] + yy_hi[j] - yy_lo[j])
+                                passes = d_xx * d_xx + d_yy * d_yy <= MAX_R2
+                            if passes:
+                                local_count += 1
 
             counts[i] = local_count
 
@@ -552,17 +565,24 @@ def _count_intersections_first_coordinate_left_side_parallel_zz(
     xx_bucket_width: np.int64,
     yy_bucket_width: np.int64,
     progress: ProgressBar | None = None,
+    ellipsoid_radius: float = math.inf,
 ) -> NDArray:
     """Count 2D box-box intersections with additional zz-axis overlap filter.
 
     Identical to _count_intersections_first_coordinate_left_side_parallel but a pair (i, j) is only
     counted when zz_lo[i] < zz_hi[j] and zz_lo[j] < zz_hi[i] as well.
     zz_lo, zz_hi : int64[N] in sorted order (same sort as xx/yy arrays).
+
+    ellipsoid_radius:
+        If finite, restrict pairs to those whose 3D centre-to-centre distance
+        (normalised by the sum of each box's half-widths per axis) is <=
+        ellipsoid_radius.  Default math.inf = full box (existing behaviour).
     """
     n_boxes = len(xx_lo)
     n_xx_buckets = len(row_starts) - 1
     n_yy_buckets = cell_offsets.shape[1] - 1
     counts = np.zeros(n_boxes, dtype=np.int32)
+    MAX_R2 = ellipsoid_radius * ellipsoid_radius
 
     for bx in numba.prange(n_xx_buckets):
         n_in_bx = xx_starts[bx + 1] - xx_starts[bx]
@@ -597,7 +617,14 @@ def _count_intersections_first_coordinate_left_side_parallel_zz(
                         if (xx_lo[i] < xx_hi[j] and xx_lo[j] < xx_hi[i] and
                                 yy_lo[i] < yy_hi[j] and yy_lo[j] < yy_hi[i] and
                                 zz_lo[i] < zz_hi[j] and zz_lo[j] < zz_hi[i]):
-                            local_count += 1
+                            passes = True
+                            if MAX_R2 < math.inf:
+                                d_xx = (xx_lo[i] + xx_hi[i] - xx_lo[j] - xx_hi[j]) / (xx_hi[i] - xx_lo[i] + xx_hi[j] - xx_lo[j])
+                                d_yy = (yy_lo[i] + yy_hi[i] - yy_lo[j] - yy_hi[j]) / (yy_hi[i] - yy_lo[i] + yy_hi[j] - yy_lo[j])
+                                d_zz = float(zz_lo[i] + zz_hi[i] - zz_lo[j] - zz_hi[j]) / float(zz_hi[i] - zz_lo[i] + zz_hi[j] - zz_lo[j])
+                                passes = d_xx * d_xx + d_yy * d_yy + d_zz * d_zz <= MAX_R2
+                            if passes:
+                                local_count += 1
 
             counts[i] = local_count
 
@@ -675,11 +702,15 @@ def count_intersections_2d(
     xx_factor: float = 2.0,
     yy_factor: float = 2.0,
     progress=None,
+    ellipsoid_radius: float = math.inf,
 ) -> NDArray:
     """Count per-box 2D intersections using a presorted spatial index.
 
     xx_lo, xx_hi, yy_lo, yy_hi : half-open [lo, hi) box bounds (any integer dtype).
     xx_factor, yy_factor : bucket-width multiplier (passed to get_multiplied_median_bucket_widths).
+    ellipsoid_radius : if finite, restrict pairs to those whose normalised centre-to-centre
+        distance is <= ellipsoid_radius.  Pass 1.0 for the inscribed ellipsoid.
+        Default math.inf = full rectangle.
 
     Returns int32[N] — number of other boxes that overlap each box in (xx, yy).
 
@@ -694,7 +725,9 @@ def count_intersections_2d(
         xx_factor, yy_factor,
     )
     *kernel_args, box_order = out
-    counts_sorted = _count_intersections_first_coordinate_left_side_parallel(*kernel_args, progress)
+    counts_sorted = _count_intersections_first_coordinate_left_side_parallel(
+        *kernel_args, progress, ellipsoid_radius
+    )
     counts = np.empty_like(counts_sorted)
     counts[box_order] = counts_sorted
     return counts
@@ -710,6 +743,7 @@ def count_intersections_2d_zz(
     xx_factor: float = 2.0,
     yy_factor: float = 2.0,
     progress=None,
+    ellipsoid_radius: float = math.inf,
 ) -> NDArray:
     """Count per-box intersections using a 2D spatial index with a zz-axis filter.
 
@@ -719,6 +753,8 @@ def count_intersections_2d_zz(
     xx_lo, xx_hi, yy_lo, yy_hi : half-open [lo, hi) 2D box bounds (any integer dtype).
     zz_lo, zz_hi               : half-open [lo, hi) bounds along the third axis (int64).
     xx_factor, yy_factor       : bucket-width multiplier for the 2D index.
+    ellipsoid_radius           : if finite, restrict pairs by 3D normalised centre-to-centre
+        distance <= ellipsoid_radius.  Default math.inf = full box.
 
     Returns int32[N].
     """
@@ -735,7 +771,7 @@ def count_intersections_2d_zz(
     # inject zz arrays after yy_hi (4th positional arg)
     xx_s, xxh_s, yy_s, yyh_s, *rest = kernel_args
     counts_sorted = _count_intersections_first_coordinate_left_side_parallel_zz(
-        xx_s, xxh_s, yy_s, yyh_s, zz_lo_s, zz_hi_s, *rest, progress
+        xx_s, xxh_s, yy_s, yyh_s, zz_lo_s, zz_hi_s, *rest, progress, ellipsoid_radius
     )
     counts = np.empty_like(counts_sorted)
     counts[box_order] = counts_sorted
@@ -767,6 +803,7 @@ def _fill_neighbors_first_coordinate_left_side_parallel_zz(
     yy_bucket_width: np.int64,
     offsets: NDArray,     # int64[N+1] CSR offsets in sorted-i space
     adj: NDArray,         # int64[M]   output: original-j neighbor indices
+    ellipsoid_radius: float = math.inf,
 ) -> None:
     """Fill CSR adjacency array for 2D+zz box intersections.
 
@@ -778,9 +815,11 @@ def _fill_neighbors_first_coordinate_left_side_parallel_zz(
     (sorted space) to original box indices stored in adj.
     offsets : int64[N+1] cumsum of counts_sorted (output of count pass).
     adj     : pre-allocated int64[M]; filled here in-place.
+    ellipsoid_radius : same semantics as in the count kernel.
     """
     n_xx_buckets = len(row_starts) - 1
     n_yy_buckets = cell_offsets.shape[1] - 1
+    MAX_R2 = ellipsoid_radius * ellipsoid_radius
 
     for bx in numba.prange(n_xx_buckets):
         for idx in range(xx_starts[bx], xx_starts[bx + 1]):
@@ -814,8 +853,15 @@ def _fill_neighbors_first_coordinate_left_side_parallel_zz(
                         if (xx_lo[i] < xx_hi[j] and xx_lo[j] < xx_hi[i] and
                                 yy_lo[i] < yy_hi[j] and yy_lo[j] < yy_hi[i] and
                                 zz_lo[i] < zz_hi[j] and zz_lo[j] < zz_hi[i]):
-                            adj[offsets[i] + cursor] = np.int64(sort_perm[j])
-                            cursor += 1
+                            passes = True
+                            if MAX_R2 < math.inf:
+                                d_xx = (xx_lo[i] + xx_hi[i] - xx_lo[j] - xx_hi[j]) / (xx_hi[i] - xx_lo[i] + xx_hi[j] - xx_lo[j])
+                                d_yy = (yy_lo[i] + yy_hi[i] - yy_lo[j] - yy_hi[j]) / (yy_hi[i] - yy_lo[i] + yy_hi[j] - yy_lo[j])
+                                d_zz = float(zz_lo[i] + zz_hi[i] - zz_lo[j] - zz_hi[j]) / float(zz_hi[i] - zz_lo[i] + zz_hi[j] - zz_lo[j])
+                                passes = d_xx * d_xx + d_yy * d_yy + d_zz * d_zz <= MAX_R2
+                            if passes:
+                                adj[offsets[i] + cursor] = np.int64(sort_perm[j])
+                                cursor += 1
 
 
 @numba.njit
@@ -851,6 +897,7 @@ def find_neighbors_2d_zz(
     zz_hi: NDArray,
     xx_factor: float = 2.0,
     yy_factor: float = 2.0,
+    ellipsoid_radius: float = math.inf,
 ) -> tuple[NDArray, NDArray]:
     """Return CSR adjacency (offsets, neighbors) of intersecting box pairs.
 
@@ -864,6 +911,8 @@ def find_neighbors_2d_zz(
         the intersection predicate uses the original values exactly.
     zz_lo, zz_hi               : third-axis bounds — same treatment.
     xx_factor, yy_factor       : passed to get_multiplied_median_bucket_widths.
+    ellipsoid_radius           : if finite, restrict pairs by 3D normalised centre-to-centre
+        distance <= ellipsoid_radius.  Default math.inf = full box.
 
     Returns
     -------
@@ -895,7 +944,7 @@ def find_neighbors_2d_zz(
         xx_s, xxh_s, yy_s, yyh_s, zz_lo_s, zz_hi_s,
         fxa_s, fya_s, xx_starts, box_order_id,
         row_starts, cell_offsets, flat_members,
-        bw_xx, bw_yy,
+        bw_xx, bw_yy, None, ellipsoid_radius,
     )
     offsets_sorted = np.zeros(N + 1, dtype=np.int64)
     np.cumsum(counts_sorted, out=offsets_sorted[1:])
@@ -909,7 +958,7 @@ def find_neighbors_2d_zz(
         box_order,                                      # sort_perm: sorted_j → orig_j
         row_starts, cell_offsets, flat_members,
         bw_xx, bw_yy,
-        offsets_sorted, adj_sorted,
+        offsets_sorted, adj_sorted, ellipsoid_radius,
     )
 
     # --- unsort to original index space ---
