@@ -440,6 +440,26 @@ def get_cell_members(
 # ---------------------------------------------------------------------------
 
 
+@numba.njit
+def _count_processor(i: np.int64, j: np.int64, counts: NDArray) -> None:
+    """Increment counts[i] for each valid pair."""
+    counts[i] += np.int32(1)
+
+
+@numba.njit
+def _fill_neighbors_processor(
+    i: np.int64,
+    j: np.int64,
+    adj: NDArray,
+    offsets: NDArray,
+    cursors: NDArray,
+    sort_perm: NDArray,
+) -> None:
+    """Write sort_perm[j] (original-index j) into adj at the cursor for row i."""
+    adj[offsets[i] + cursors[i]] = np.int64(sort_perm[j])
+    cursors[i] += np.int64(1)
+
+
 def _build_xx_index(
     first_xx_all: NDArray,
     n_xx: int,
@@ -464,7 +484,7 @@ def _build_xx_index(
 
 
 @numba.njit(parallel=True)
-def _count_intersections_first_coordinate_left_side_parallel(
+def visit_box_intersections_2d(
     xx_lo: NDArray,
     xx_hi: NDArray,
     yy_lo: NDArray,
@@ -478,26 +498,27 @@ def _count_intersections_first_coordinate_left_side_parallel(
     flat_members: NDArray,
     xx_bucket_width: np.int64,
     yy_bucket_width: np.int64,
+    processor,
+    processor_args=(),
     progress: ProgressBar | None = None,
     ellipsoid_radius: float = math.inf,
-) -> NDArray:
-    """Count 2D box-box intersections; prange over xx-buckets.
+) -> None:
+    """Visit every intersecting 2D box pair and call processor(i, j, *processor_args).
 
-    All array arguments are in sorted order (sorted by first_xx_bucket).
-    box_order[idx] gives the original (unsorted) box index for sorted position idx.
+    All array arguments must be in sorted order (sorted by first_xx_bucket).
+    Each pair (i, j) with i != j is visited exactly once via canonical-cell
+    deduplication.  i belongs to the prange thread for its first xx-bucket —
+    the processor may safely write to arrays indexed by i without locks.
 
-    Returns counts[N] in sorted order; caller must unsort via counts[box_order] = counts_sorted.
-
-    ellipsoid_radius:
-        If finite, restrict pairs to those whose centre-to-centre distance (normalised
-        by the sum of each box's half-widths per axis) is <= ellipsoid_radius.
-        Pass 1.0 for the inscribed ellipsoid; default math.inf = full rectangle.
+    processor : @numba.njit callable with signature (i, j, *processor_args).
+    processor_args : tuple of extra arguments forwarded to processor.
+    ellipsoid_radius : if finite, restrict pairs whose normalised 2D
+        centre-to-centre distance exceeds this value.  Default math.inf = full
+        rectangle (no extra filter).
     """
-    n_boxes = len(xx_lo)
+    MAX_R2 = ellipsoid_radius * ellipsoid_radius
     n_xx_buckets = len(row_starts) - 1
     n_yy_buckets = cell_offsets.shape[1] - 1
-    counts = np.zeros(n_boxes, dtype=np.int32)
-    MAX_R2 = ellipsoid_radius * ellipsoid_radius
 
     for bx in numba.prange(n_xx_buckets):
         n_in_bx = xx_starts[bx + 1] - xx_starts[bx]
@@ -515,7 +536,6 @@ def _count_intersections_first_coordinate_left_side_parallel(
             single_cell = (first_xx_bucket == last_xx_bucket and
                            first_yy_bucket == last_yy_bucket)
 
-            local_count = np.int32(0)
             for xx_bucket_idx in range(first_xx_bucket, last_xx_bucket + 1):
                 for yy_bucket_idx in range(first_yy_bucket, last_yy_bucket + 1):
                     start = row_starts[xx_bucket_idx] + cell_offsets[xx_bucket_idx, yy_bucket_idx]
@@ -537,18 +557,14 @@ def _count_intersections_first_coordinate_left_side_parallel(
                                 d_yy = (yy_lo[i] + yy_hi[i] - yy_lo[j] - yy_hi[j]) / (yy_hi[i] - yy_lo[i] + yy_hi[j] - yy_lo[j])
                                 passes = d_xx * d_xx + d_yy * d_yy <= MAX_R2
                             if passes:
-                                local_count += 1
-
-            counts[i] = local_count
+                                processor(i, j, *processor_args)
 
         if progress is not None:
             progress.update(n_in_bx)
 
-    return counts
-
 
 @numba.njit(parallel=True)
-def _count_intersections_first_coordinate_left_side_parallel_zz(
+def visit_box_intersections_2d_zz(
     xx_lo: NDArray,
     xx_hi: NDArray,
     yy_lo: NDArray,
@@ -564,25 +580,21 @@ def _count_intersections_first_coordinate_left_side_parallel_zz(
     flat_members: NDArray,
     xx_bucket_width: np.int64,
     yy_bucket_width: np.int64,
+    processor,
+    processor_args=(),
     progress: ProgressBar | None = None,
     ellipsoid_radius: float = math.inf,
-) -> NDArray:
-    """Count 2D box-box intersections with additional zz-axis overlap filter.
+) -> None:
+    """Visit every intersecting (xx, yy, zz) box pair and call processor(i, j, *processor_args).
 
-    Identical to _count_intersections_first_coordinate_left_side_parallel but a pair (i, j) is only
-    counted when zz_lo[i] < zz_hi[j] and zz_lo[j] < zz_hi[i] as well.
-    zz_lo, zz_hi : int64[N] in sorted order (same sort as xx/yy arrays).
-
-    ellipsoid_radius:
-        If finite, restrict pairs to those whose 3D centre-to-centre distance
-        (normalised by the sum of each box's half-widths per axis) is <=
-        ellipsoid_radius.  Default math.inf = full box (existing behaviour).
+    Same as visit_box_intersections_2d but a pair is only visited when
+    zz_lo[i] < zz_hi[j] and zz_lo[j] < zz_hi[i] also holds.
+    zz_lo, zz_hi : int64[N] in the same sorted order as xx/yy arrays.
+    ellipsoid_radius : if finite, applies a 3D normalised distance filter.
     """
-    n_boxes = len(xx_lo)
+    MAX_R2 = ellipsoid_radius * ellipsoid_radius
     n_xx_buckets = len(row_starts) - 1
     n_yy_buckets = cell_offsets.shape[1] - 1
-    counts = np.zeros(n_boxes, dtype=np.int32)
-    MAX_R2 = ellipsoid_radius * ellipsoid_radius
 
     for bx in numba.prange(n_xx_buckets):
         n_in_bx = xx_starts[bx + 1] - xx_starts[bx]
@@ -600,7 +612,6 @@ def _count_intersections_first_coordinate_left_side_parallel_zz(
             single_cell = (first_xx_bucket == last_xx_bucket and
                            first_yy_bucket == last_yy_bucket)
 
-            local_count = np.int32(0)
             for xx_bucket_idx in range(first_xx_bucket, last_xx_bucket + 1):
                 for yy_bucket_idx in range(first_yy_bucket, last_yy_bucket + 1):
                     start = row_starts[xx_bucket_idx] + cell_offsets[xx_bucket_idx, yy_bucket_idx]
@@ -624,14 +635,10 @@ def _count_intersections_first_coordinate_left_side_parallel_zz(
                                 d_zz = float(zz_lo[i] + zz_hi[i] - zz_lo[j] - zz_hi[j]) / float(zz_hi[i] - zz_lo[i] + zz_hi[j] - zz_lo[j])
                                 passes = d_xx * d_xx + d_yy * d_yy + d_zz * d_zz <= MAX_R2
                             if passes:
-                                local_count += 1
-
-            counts[i] = local_count
+                                processor(i, j, *processor_args)
 
         if progress is not None:
             progress.update(n_in_bx)
-
-    return counts
 
 
 def _setup_first_coordinate_left_side_sort(
@@ -725,8 +732,10 @@ def count_intersections_2d(
         xx_factor, yy_factor,
     )
     *kernel_args, box_order = out
-    counts_sorted = _count_intersections_first_coordinate_left_side_parallel(
-        *kernel_args, progress, ellipsoid_radius
+    n_boxes = len(box_order)
+    counts_sorted = np.zeros(n_boxes, dtype=np.int32)
+    visit_box_intersections_2d(
+        *kernel_args, _count_processor, (counts_sorted,), progress, ellipsoid_radius,
     )
     counts = np.empty_like(counts_sorted)
     counts[box_order] = counts_sorted
@@ -770,8 +779,11 @@ def count_intersections_2d_zz(
 
     # inject zz arrays after yy_hi (4th positional arg)
     xx_s, xxh_s, yy_s, yyh_s, *rest = kernel_args
-    counts_sorted = _count_intersections_first_coordinate_left_side_parallel_zz(
-        xx_s, xxh_s, yy_s, yyh_s, zz_lo_s, zz_hi_s, *rest, progress, ellipsoid_radius
+    n_boxes = len(box_order)
+    counts_sorted = np.zeros(n_boxes, dtype=np.int32)
+    visit_box_intersections_2d_zz(
+        xx_s, xxh_s, yy_s, yyh_s, zz_lo_s, zz_hi_s, *rest,
+        _count_processor, (counts_sorted,), progress, ellipsoid_radius,
     )
     counts = np.empty_like(counts_sorted)
     counts[box_order] = counts_sorted
@@ -781,87 +793,6 @@ def count_intersections_2d_zz(
 # ---------------------------------------------------------------------------
 # Per-box neighbor listing (CSR adjacency)
 # ---------------------------------------------------------------------------
-
-
-@numba.njit(parallel=True)
-def _fill_neighbors_first_coordinate_left_side_parallel_zz(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
-    zz_lo: NDArray,
-    zz_hi: NDArray,
-    first_xx_all: NDArray,
-    first_yy_all: NDArray,
-    xx_starts: NDArray,
-    box_order: NDArray,   # identity permutation (box_order_id)
-    sort_perm: NDArray,   # actual sort permutation: sort_perm[sorted_j] = orig_j
-    row_starts: NDArray,
-    cell_offsets: NDArray,
-    flat_members: NDArray,
-    xx_bucket_width: np.int64,
-    yy_bucket_width: np.int64,
-    offsets: NDArray,     # int64[N+1] CSR offsets in sorted-i space
-    adj: NDArray,         # int64[M]   output: original-j neighbor indices
-    ellipsoid_radius: float = math.inf,
-) -> None:
-    """Fill CSR adjacency array for 2D+zz box intersections.
-
-    Parallel twin of _fill_neighbors_first_coordinate_left_side_parallel_zz — same prange-over-bx
-    structure as the count kernel.  Each sorted position idx is owned by
-    exactly one bx thread → writes to adj[offsets[idx]:...] are race-free.
-
-    sort_perm[sorted_j] = original_j — used to convert flat_members indices
-    (sorted space) to original box indices stored in adj.
-    offsets : int64[N+1] cumsum of counts_sorted (output of count pass).
-    adj     : pre-allocated int64[M]; filled here in-place.
-    ellipsoid_radius : same semantics as in the count kernel.
-    """
-    n_xx_buckets = len(row_starts) - 1
-    n_yy_buckets = cell_offsets.shape[1] - 1
-    MAX_R2 = ellipsoid_radius * ellipsoid_radius
-
-    for bx in numba.prange(n_xx_buckets):
-        for idx in range(xx_starts[bx], xx_starts[bx + 1]):
-            i = np.int64(box_order[idx])   # = idx with identity box_order
-            first_xx_bucket = np.int64(bx)
-            last_xx_bucket  = np.int64(math.ceil(xx_hi[i] / xx_bucket_width)) - np.int64(1)
-            first_yy_bucket = first_yy_all[i]
-            last_yy_bucket  = np.int64(math.ceil(yy_hi[i] / yy_bucket_width)) - np.int64(1)
-
-            last_xx_bucket  = min(last_xx_bucket,  np.int64(n_xx_buckets - 1))
-            first_yy_bucket = max(first_yy_bucket, np.int64(0))
-            last_yy_bucket  = min(last_yy_bucket,  np.int64(n_yy_buckets - 1))
-
-            single_cell = (first_xx_bucket == last_xx_bucket and
-                           first_yy_bucket == last_yy_bucket)
-
-            cursor = np.int64(0)
-            for xx_bucket_idx in range(first_xx_bucket, last_xx_bucket + 1):
-                for yy_bucket_idx in range(first_yy_bucket, last_yy_bucket + 1):
-                    start = row_starts[xx_bucket_idx] + cell_offsets[xx_bucket_idx, yy_bucket_idx]
-                    end   = row_starts[xx_bucket_idx] + cell_offsets[xx_bucket_idx, yy_bucket_idx + 1]
-                    for member_pos in range(start, end):
-                        j = np.int64(flat_members[member_pos])
-                        if j == i:
-                            continue
-                        if not single_cell:
-                            canonical_bx = max(first_xx_bucket, first_xx_all[j])
-                            canonical_by = max(first_yy_bucket, first_yy_all[j])
-                            if xx_bucket_idx != canonical_bx or yy_bucket_idx != canonical_by:
-                                continue
-                        if (xx_lo[i] < xx_hi[j] and xx_lo[j] < xx_hi[i] and
-                                yy_lo[i] < yy_hi[j] and yy_lo[j] < yy_hi[i] and
-                                zz_lo[i] < zz_hi[j] and zz_lo[j] < zz_hi[i]):
-                            passes = True
-                            if MAX_R2 < math.inf:
-                                d_xx = (xx_lo[i] + xx_hi[i] - xx_lo[j] - xx_hi[j]) / (xx_hi[i] - xx_lo[i] + xx_hi[j] - xx_lo[j])
-                                d_yy = (yy_lo[i] + yy_hi[i] - yy_lo[j] - yy_hi[j]) / (yy_hi[i] - yy_lo[i] + yy_hi[j] - yy_lo[j])
-                                d_zz = float(zz_lo[i] + zz_hi[i] - zz_lo[j] - zz_hi[j]) / float(zz_hi[i] - zz_lo[i] + zz_hi[j] - zz_lo[j])
-                                passes = d_xx * d_xx + d_yy * d_yy + d_zz * d_zz <= MAX_R2
-                            if passes:
-                                adj[offsets[i] + cursor] = np.int64(sort_perm[j])
-                                cursor += 1
 
 
 @numba.njit
@@ -939,12 +870,14 @@ def find_neighbors_2d_zz(
     zz_lo_s = zz_lo_f[box_order]
     zz_hi_s = zz_hi_f[box_order]
 
+    _zz_kernel_args = (xx_s, xxh_s, yy_s, yyh_s, zz_lo_s, zz_hi_s,
+                       fxa_s, fya_s, xx_starts, box_order_id,
+                       row_starts, cell_offsets, flat_members, bw_xx, bw_yy)
+
     # --- count pass ---
-    counts_sorted = _count_intersections_first_coordinate_left_side_parallel_zz(
-        xx_s, xxh_s, yy_s, yyh_s, zz_lo_s, zz_hi_s,
-        fxa_s, fya_s, xx_starts, box_order_id,
-        row_starts, cell_offsets, flat_members,
-        bw_xx, bw_yy, None, ellipsoid_radius,
+    counts_sorted = np.zeros(N, dtype=np.int32)
+    visit_box_intersections_2d_zz(
+        *_zz_kernel_args, _count_processor, (counts_sorted,), None, ellipsoid_radius,
     )
     offsets_sorted = np.zeros(N + 1, dtype=np.int64)
     np.cumsum(counts_sorted, out=offsets_sorted[1:])
@@ -952,13 +885,12 @@ def find_neighbors_2d_zz(
 
     # --- fill pass ---
     adj_sorted = np.empty(M, dtype=np.int64)
-    _fill_neighbors_first_coordinate_left_side_parallel_zz(
-        xx_s, xxh_s, yy_s, yyh_s, zz_lo_s, zz_hi_s,
-        fxa_s, fya_s, xx_starts, box_order_id,
-        box_order,                                      # sort_perm: sorted_j → orig_j
-        row_starts, cell_offsets, flat_members,
-        bw_xx, bw_yy,
-        offsets_sorted, adj_sorted, ellipsoid_radius,
+    cursors = np.zeros(N, dtype=np.int64)
+    visit_box_intersections_2d_zz(
+        *_zz_kernel_args,
+        _fill_neighbors_processor,
+        (adj_sorted, offsets_sorted, cursors, box_order),  # sort_perm: sorted_j → orig_j
+        None, ellipsoid_radius,
     )
 
     # --- unsort to original index space ---
