@@ -10,10 +10,12 @@ readme="README.md"
 authors=[
     {name="MatteoLacki",email="matteo.lacki@gmail.com"},
 ]
-requires-python = ">=3.6"
-# dependencies = [
-#     "click",
-# ]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "numba",
+    "numba_progress",
+]
 
 # [project.optional-dependencies]
 # dev = [
