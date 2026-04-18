@@ -8,6 +8,7 @@ from boxing.spatial_index import (
     box_widths_2d,
     build_spatial_index_2d,
     count_cell_memberships,
+    find_top_k_neighbors_2d_zz,
     get_cell_members,
     get_multiplied_median_bucket_widths,
     validate_boxes_2d,
@@ -154,6 +155,107 @@ _REAL_DATA = (
     / "temp"
     / "dev_intersection_boxes.parquet"
 )
+
+
+# ---------------------------------------------------------------------------
+# find_top_k_neighbors_2d_zz
+# ---------------------------------------------------------------------------
+#
+# 4 boxes — all pairwise overlapping in frame/scan; tof selectively filters:
+#
+#   idx | frame    | scan    | tof       | intensity
+#    0  | [0, 10)  | [0, 10) | [ 0,  50) |  50
+#    1  | [5, 15)  | [5, 15) | [ 0,  50) | 200
+#    2  | [3, 12)  | [3, 12) | [60, 100) | 100
+#    3  | [2,  8)  | [2,  8) | [40,  80) | 300
+#
+# tof overlaps:  0∩1 ✓  0∩2 ✗  0∩3 ✓  1∩2 ✗  1∩3 ✓  2∩3 ✓
+#
+# → neighbors with zz filter:
+#   0: {1: 200, 3: 300}
+#   1: {0:  50, 3: 300}
+#   2: {3: 300}
+#   3: {0:  50, 1: 200, 2: 100}
+
+
+def _top_k_as_dict(neighbor_ids, neighbor_ints, i):
+    """Valid (non-empty) slots of row i as {original_id: intensity}."""
+    return {
+        int(neighbor_ids[i, s]): int(neighbor_ints[i, s])
+        for s in range(neighbor_ids.shape[1])
+        if neighbor_ids[i, s] >= 0
+    }
+
+
+@pytest.fixture
+def zz_boxes():
+    xx_lo = np.array([0, 5, 3, 2], dtype=np.int32)
+    xx_hi = np.array([10, 15, 12, 8], dtype=np.int32)
+    yy_lo = np.array([0, 5, 3, 2], dtype=np.int32)
+    yy_hi = np.array([10, 15, 12, 8], dtype=np.int32)
+    zz_lo = np.array([0,  0, 60, 40], dtype=np.int64)
+    zz_hi = np.array([50, 50, 100, 80], dtype=np.int64)
+    intensities = np.array([50, 200, 100, 300], dtype=np.int64)
+    return xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi, intensities
+
+
+def test_top_k_all_neighbors_fit(zz_boxes):
+    """top_k >= max degree: all neighbors recorded, empty slots are -1/0."""
+    xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi, intensities = zz_boxes
+    ids, ints = find_top_k_neighbors_2d_zz(
+        xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi, intensities, top_k=3,
+    )
+    assert ids.shape == (4, 3)
+    assert ints.shape == (4, 3)
+    assert _top_k_as_dict(ids, ints, 0) == {1: 200, 3: 300}
+    assert _top_k_as_dict(ids, ints, 1) == {0: 50, 3: 300}
+    assert _top_k_as_dict(ids, ints, 2) == {3: 300}
+    assert _top_k_as_dict(ids, ints, 3) == {0: 50, 1: 200, 2: 100}
+
+
+def test_top_k_eviction(zz_boxes):
+    """top_k=2: box 3 has 3 neighbors; only the 2 most intense survive."""
+    xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi, intensities = zz_boxes
+    ids, ints = find_top_k_neighbors_2d_zz(
+        xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi, intensities, top_k=2,
+    )
+    assert _top_k_as_dict(ids, ints, 0) == {1: 200, 3: 300}
+    assert _top_k_as_dict(ids, ints, 1) == {0: 50, 3: 300}
+    assert _top_k_as_dict(ids, ints, 2) == {3: 300}
+    # box 3 neighbors: {0:50, 1:200, 2:100}; top-2 by intensity = {1:200, 2:100}
+    assert _top_k_as_dict(ids, ints, 3) == {1: 200, 2: 100}
+
+
+def test_top_k_no_neighbors():
+    """Isolated box (no overlapping neighbors): all slots empty."""
+    xx_lo = np.array([0,  100], dtype=np.int32)
+    xx_hi = np.array([10, 110], dtype=np.int32)
+    yy_lo = np.array([0,  100], dtype=np.int32)
+    yy_hi = np.array([10, 110], dtype=np.int32)
+    zz_lo = np.array([0,  0],   dtype=np.int64)
+    zz_hi = np.array([50, 50],  dtype=np.int64)
+    intensities = np.array([100, 200], dtype=np.int64)
+    ids, ints = find_top_k_neighbors_2d_zz(
+        xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi, intensities, top_k=3,
+    )
+    assert _top_k_as_dict(ids, ints, 0) == {}
+    assert _top_k_as_dict(ids, ints, 1) == {}
+
+
+def test_top_k_tof_filter_removes_pairs():
+    """Two boxes overlapping in xx/yy but disjoint in zz: no neighbors recorded."""
+    xx_lo = np.array([0, 5], dtype=np.int32)
+    xx_hi = np.array([10, 15], dtype=np.int32)
+    yy_lo = np.array([0, 5], dtype=np.int32)
+    yy_hi = np.array([10, 15], dtype=np.int32)
+    zz_lo = np.array([0,  100], dtype=np.int64)
+    zz_hi = np.array([50, 200], dtype=np.int64)
+    intensities = np.array([100, 200], dtype=np.int64)
+    ids, ints = find_top_k_neighbors_2d_zz(
+        xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi, intensities, top_k=2,
+    )
+    assert _top_k_as_dict(ids, ints, 0) == {}
+    assert _top_k_as_dict(ids, ints, 1) == {}
 
 
 @pytest.mark.skipif(not _REAL_DATA.exists(), reason="dev data not available")

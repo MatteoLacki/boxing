@@ -903,3 +903,110 @@ def find_neighbors_2d_zz(
     _unsort_adj(adj_sorted, offsets_sorted, offsets_orig, box_order, N, adj_orig)
 
     return offsets_orig, adj_orig
+
+
+# ---------------------------------------------------------------------------
+# Per-box top-k intense neighbor listing
+# ---------------------------------------------------------------------------
+
+
+@numba.njit
+def _top_k_neighbors_processor(
+    i: np.int64,
+    j: np.int64,
+    neighbor_ids: NDArray,
+    neighbor_ints: NDArray,
+    intensities: NDArray,
+    sort_perm: NDArray,
+) -> None:
+    """Insert neighbor j into the top-k table for box i (min-intensity eviction).
+
+    neighbor_ids, neighbor_ints : int32/int64 [N, top_k] indexed by original i.
+    intensities : int64[N] in sorted order.
+    sort_perm   : box_order (sorted → original).
+
+    Zero is the empty-slot sentinel in neighbor_ints — neighbors with intensity
+    zero are never inserted.  Safe for ion-count data where zero means no signal.
+    """
+    orig_i = np.int64(sort_perm[i])
+    new_intensity = intensities[j]
+    if new_intensity == np.int64(0):
+        return
+    new_id = np.int32(sort_perm[j])
+    top_k = neighbor_ids.shape[1]
+
+    min_intensity = neighbor_ints[orig_i, 0]
+    min_slot = np.int64(0)
+    for slot in range(1, top_k):
+        v = neighbor_ints[orig_i, slot]
+        if v < min_intensity:
+            min_intensity = v
+            min_slot = np.int64(slot)
+
+    if new_intensity > min_intensity:
+        neighbor_ids[orig_i, min_slot] = new_id
+        neighbor_ints[orig_i, min_slot] = new_intensity
+
+
+def find_top_k_neighbors_2d_zz(
+    xx_lo: NDArray,
+    xx_hi: NDArray,
+    yy_lo: NDArray,
+    yy_hi: NDArray,
+    zz_lo: NDArray,
+    zz_hi: NDArray,
+    intensities: NDArray,
+    top_k: int,
+    xx_factor: float = 2.0,
+    yy_factor: float = 2.0,
+    progress=None,
+    ellipsoid_radius: float = math.inf,
+) -> tuple[NDArray, NDArray]:
+    """Return the top-k most intense neighbors per box, using a 2D index + zz filter.
+
+    A pair (i, j) is a candidate when all three axes overlap (same predicate as
+    find_neighbors_2d_zz).  Among all candidates for box i, only the top_k with
+    the highest intensity are kept.
+
+    intensities : int64-compatible array of length N — intensity of each box in
+        original order.  Zero-intensity boxes are never recorded as neighbors.
+
+    Returns
+    -------
+    neighbor_ids  : int32[N, top_k]  — original box ids of the top-k neighbors;
+        unused slots contain -1.
+    neighbor_ints : int64[N, top_k]  — corresponding intensities; unused slots
+        contain 0.
+
+    Both arrays are in original box order (row i = box i as passed in).
+    Result is not sorted within each row; sort by neighbor_ints[i] descending
+    if order matters.
+    """
+    N = len(np.asarray(xx_lo))
+    out = _setup_first_coordinate_left_side_sort(
+        np.asarray(xx_lo, dtype=np.float64), np.asarray(xx_hi, dtype=np.float64),
+        np.asarray(yy_lo, dtype=np.float64), np.asarray(yy_hi, dtype=np.float64),
+        xx_factor, yy_factor,
+    )
+    *kernel_args, box_order = out
+
+    xx_s, xxh_s, yy_s, yyh_s, fxa_s, fya_s, xx_starts, box_order_id, \
+        row_starts, cell_offsets, flat_members, bw_xx, bw_yy = kernel_args
+
+    zz_lo_s = np.asarray(zz_lo, dtype=np.int64)[box_order]
+    zz_hi_s = np.asarray(zz_hi, dtype=np.int64)[box_order]
+    intensities_s = np.asarray(intensities, dtype=np.int64)[box_order]
+
+    neighbor_ids  = np.full((N, top_k), -1, dtype=np.int32)
+    neighbor_ints = np.zeros((N, top_k), dtype=np.int64)
+
+    visit_box_intersections_2d_zz(
+        xx_s, xxh_s, yy_s, yyh_s, zz_lo_s, zz_hi_s,
+        fxa_s, fya_s, xx_starts, box_order_id,
+        row_starts, cell_offsets, flat_members, bw_xx, bw_yy,
+        _top_k_neighbors_processor,
+        (neighbor_ids, neighbor_ints, intensities_s, box_order),
+        progress, ellipsoid_radius,
+    )
+
+    return neighbor_ids, neighbor_ints
