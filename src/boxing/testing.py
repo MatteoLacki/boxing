@@ -11,6 +11,7 @@ def brute_force_top_k_neighbors_2d_zz(
     boxes: NDArray,
     intensities: NDArray,
     top_k: int,
+    precursor_idxs: NDArray | None = None,
 ) -> list[int]:
     """Return exact top-k neighbour indices for box i by exhaustive search.
 
@@ -19,6 +20,8 @@ def brute_force_top_k_neighbors_2d_zz(
     Among all neighbours, return the indices of the top_k with highest intensity.
     When there are fewer than top_k neighbours, return all of them.
     Tie-breaking at the boundary is arbitrary (argpartition order).
+    precursor_idxs : when provided, returned ids are precursor indices rather
+        than box indices.
     """
     boxes = np.asarray(boxes)
     intensities = np.asarray(intensities)
@@ -34,10 +37,14 @@ def brute_force_top_k_neighbors_2d_zz(
     mask[i] = False
     positions = np.where(mask)[0]
     if len(positions) <= top_k:
-        return positions.tolist()
-    intens = intensities[positions]
-    top_local = np.argpartition(intens, -top_k)[-top_k:]
-    return positions[top_local].tolist()
+        result = positions
+    else:
+        intens = intensities[positions]
+        top_local = np.argpartition(intens, -top_k)[-top_k:]
+        result = positions[top_local]
+    if precursor_idxs is not None:
+        return np.asarray(precursor_idxs)[result].tolist()
+    return result.tolist()
 
 
 def validate_top_k_neighbors_2d_zz(
@@ -50,6 +57,7 @@ def validate_top_k_neighbors_2d_zz(
     indices: NDArray | None = None,
     K: int = 100,
     seed: int = 42,
+    precursor_idxs: NDArray | None = None,
 ) -> list[tuple]:
     """Validate neighbor_ids / neighbor_ints against brute-force results.
 
@@ -62,6 +70,8 @@ def validate_top_k_neighbors_2d_zz(
         using the given seed.
     K, seed:
         Used only when indices is None.
+    precursor_idxs : when provided, neighbor_ids are expected to contain
+        precursor indices (precursor_idxs[j]) rather than box indices (j).
 
     Returns
     -------
@@ -80,6 +90,9 @@ def validate_top_k_neighbors_2d_zz(
     yy_lo, yy_hi = boxes[:, 2], boxes[:, 3]
     zz_lo, zz_hi = boxes[:, 4], boxes[:, 5]
 
+    if precursor_idxs is not None:
+        precursor_idxs = np.asarray(precursor_idxs)
+
     N = len(boxes)
     if indices is None:
         rng = np.random.default_rng(seed)
@@ -95,13 +108,18 @@ def validate_top_k_neighbors_2d_zz(
             (zz_lo < zz_hi[i]) & (zz_lo[i] < zz_hi)
         )
         mask[i] = False
-        all_positions = np.where(mask)[0]
+        all_positions = np.where(mask)[0]  # box indices of genuine neighbours
+
+        if precursor_idxs is not None:
+            all_ids = set(precursor_idxs[all_positions].tolist())
+        else:
+            all_ids = set(all_positions.tolist())
 
         valid_slots = neighbor_ids[i] >= 0
         actual_ids = set(neighbor_ids[i][valid_slots].tolist())
         actual_intens = neighbor_ints[i][valid_slots]
 
-        spurious = actual_ids - set(all_positions.tolist())
+        spurious = actual_ids - all_ids
         if spurious:
             mismatches.append((i, f"spurious ids: {spurious}"))
             continue
@@ -113,11 +131,17 @@ def validate_top_k_neighbors_2d_zz(
 
         if len(actual_intens) > 0:
             min_kept = int(actual_intens.min())
-            excluded_ids = np.array(
-                list(set(all_positions.tolist()) - actual_ids), dtype=np.int64
-            )
-            if len(excluded_ids) > 0:
-                excluded_intens = intensities[excluded_ids]
+            # Excluded neighbours: genuine positions whose id is not in actual_ids.
+            if precursor_idxs is not None:
+                excluded_positions = all_positions[
+                    ~np.isin(precursor_idxs[all_positions], list(actual_ids))
+                ]
+            else:
+                excluded_positions = np.array(
+                    list(all_ids - actual_ids), dtype=np.int64
+                )
+            if len(excluded_positions) > 0:
+                excluded_intens = intensities[excluded_positions]
                 if (excluded_intens > min_kept).any():
                     mismatches.append(
                         (i, f"better neighbour excluded (min_kept={min_kept})")

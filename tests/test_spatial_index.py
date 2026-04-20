@@ -283,6 +283,19 @@ def test_dense_to_csr_no_neighbors():
     assert len(flat_ids) == 0
 
 
+def test_top_k_validate_with_precursor_idxs(zz_boxes):
+    """validate_top_k_neighbors_2d_zz accepts precursor_idxs and reports no mismatches."""
+    boxes, intensities = zz_boxes
+    pidxs = np.array([10, 20, 30, 40], dtype=np.int32)
+    ids, ints = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3, precursor_idxs=pidxs)
+    mismatches = validate_top_k_neighbors_2d_zz(
+        boxes, intensities, ids, ints, top_k=3,
+        indices=np.arange(4),
+        precursor_idxs=pidxs,
+    )
+    assert mismatches == [], mismatches
+
+
 def test_top_k_precursor_idxs(zz_boxes):
     """precursor_idxs remaps recorded neighbor ids; no-arg call returns box ids."""
     boxes, intensities = zz_boxes
