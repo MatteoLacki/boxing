@@ -768,8 +768,11 @@ def find_top_k_neighbors_2d_zz(
 
     if precursor_idxs is None:
         precursor_idxs = np.arange(N, dtype=np.int32)
+        prec_to_row = None
     else:
         precursor_idxs = np.asarray(precursor_idxs, dtype=np.int32)
+        prec_to_row = np.full(int(precursor_idxs.max()) + 1, -1, dtype=np.int32)
+        prec_to_row[precursor_idxs] = np.arange(N, dtype=np.int32)
     precursor_idxs_s = precursor_idxs[box_order]
 
     neighbor_ids  = np.full((N, top_k), -1, dtype=np.int32)
@@ -783,52 +786,50 @@ def find_top_k_neighbors_2d_zz(
         progress, ellipsoid_radius,
     )
 
-    return neighbor_ids, neighbor_ints
+    return neighbor_ids, neighbor_ints, prec_to_row
 
 
 def dense_neighbors_to_csr(
     neighbor_ids: NDArray,
     neighbor_ints: NDArray | None = None,
-    precursor_idxs: NDArray | None = None,
+    prec_to_row: NDArray | None = None,
 ):
     """Convert dense (N, K) top-k neighbor arrays to CSR format, skipping empty slots.
 
     neighbor_ids  : int32[N, K]  — neighbor (or precursor) indices; -1 = empty slot.
     neighbor_ints : int64[N, K] or None — corresponding intensities.
-    precursor_idxs : int array of length N or None.
-        When provided, offsets is indexed by precursor index so that
-        offsets[prec_idx]:offsets[prec_idx+1] gives the neighbors of precursor
-        prec_idx.  precursor_idxs must be a permutation of 0..N-1.
+    prec_to_row   : int32 array returned by find_top_k_neighbors_2d_zz when
+        precursor_idxs is provided.  prec_to_row[prec_idx] = row in neighbor_ids
+        for that precursor (-1 if absent).  When provided, offsets has size
+        len(prec_to_row)+1 and is directly indexed by precursor_idx:
+            offsets[prec_idx]:offsets[prec_idx+1]  →  neighbors of prec_idx.
         When None, offsets[i]:offsets[i+1] gives the neighbors of box i.
 
     Returns
     -------
-    offsets  : int64[N + 1]
+    offsets  : int64[len(prec_to_row)+1 or N+1]
     flat_ids : same dtype as neighbor_ids, shape (M,)
     flat_ints: same dtype as neighbor_ints, shape (M,)  — only when neighbor_ints given
     """
-    if precursor_idxs is not None:
-        pidxs = np.asarray(precursor_idxs)
-        perm = np.argsort(pidxs)            # rows sorted by precursor_idx value
-        neighbor_ids = neighbor_ids[perm]
-        if neighbor_ints is not None:
-            neighbor_ints = neighbor_ints[perm]
-        sorted_pidxs = pidxs[perm]
-
-        valid = neighbor_ids >= 0
+    if prec_to_row is not None:
+        present = np.where(prec_to_row >= 0)[0]   # prec_idx values, ascending
+        rows = prec_to_row[present]                # corresponding rows in neighbor_ids
+        reordered_ids = neighbor_ids[rows]         # (len(present), K) in prec_idx order
+        valid = reordered_ids >= 0
         counts = valid.sum(axis=1).astype(np.int64)
-
-        # offsets indexed by precursor_idx value — size max(prec_idx)+2
-        offsets = np.zeros(int(sorted_pidxs[-1]) + 2, dtype=np.int64)
-        offsets[sorted_pidxs + 1] = counts
+        offsets = np.zeros(len(prec_to_row) + 1, dtype=np.int64)
+        offsets[present + 1] = counts
         np.cumsum(offsets, out=offsets)
+        flat_ids = reordered_ids[valid]
+        if neighbor_ints is not None:
+            return offsets, flat_ids, neighbor_ints[rows][valid]
+        return offsets, flat_ids
     else:
         valid = neighbor_ids >= 0
         counts = valid.sum(axis=1).astype(np.int64)
         offsets = np.zeros(len(counts) + 1, dtype=np.int64)
         np.cumsum(counts, out=offsets[1:])
-
-    flat_ids = neighbor_ids[valid]
-    if neighbor_ints is not None:
-        return offsets, flat_ids, neighbor_ints[valid]
-    return offsets, flat_ids
+        flat_ids = neighbor_ids[valid]
+        if neighbor_ints is not None:
+            return offsets, flat_ids, neighbor_ints[valid]
+        return offsets, flat_ids

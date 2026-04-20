@@ -162,7 +162,7 @@ def zz_boxes():
 def test_top_k_all_neighbors_fit(zz_boxes):
     """top_k >= max degree: all neighbors recorded, empty slots are -1/0."""
     boxes, intensities = zz_boxes
-    ids, ints = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
+    ids, ints, _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
     assert ids.shape == (4, 3)
     assert ints.shape == (4, 3)
     assert _top_k_as_dict(ids, ints, 0) == {1: 200, 3: 300}
@@ -174,7 +174,7 @@ def test_top_k_all_neighbors_fit(zz_boxes):
 def test_top_k_eviction(zz_boxes):
     """top_k=2: box 3 has 3 neighbors; only the 2 most intense survive."""
     boxes, intensities = zz_boxes
-    ids, ints = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=2)
+    ids, ints, _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=2)
     assert _top_k_as_dict(ids, ints, 0) == {1: 200, 3: 300}
     assert _top_k_as_dict(ids, ints, 1) == {0: 50, 3: 300}
     assert _top_k_as_dict(ids, ints, 2) == {3: 300}
@@ -189,7 +189,7 @@ def test_top_k_no_neighbors():
         [100, 110, 100, 110, 0, 50],
     ], dtype=np.int64)
     intensities = np.array([100, 200], dtype=np.int64)
-    ids, ints = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
+    ids, ints, _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
     assert _top_k_as_dict(ids, ints, 0) == {}
     assert _top_k_as_dict(ids, ints, 1) == {}
 
@@ -201,7 +201,7 @@ def test_top_k_tof_filter_removes_pairs():
         [5, 15,   5, 15, 100, 200],
     ], dtype=np.int64)
     intensities = np.array([100, 200], dtype=np.int64)
-    ids, ints = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=2)
+    ids, ints, _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=2)
     assert _top_k_as_dict(ids, ints, 0) == {}
     assert _top_k_as_dict(ids, ints, 1) == {}
 
@@ -239,7 +239,7 @@ def test_self_intersection_count_on_real_data():
 def test_top_k_validated_against_brute_force(zz_boxes):
     """find_top_k_neighbors_2d_zz result matches brute-force on all 4 boxes."""
     boxes, intensities = zz_boxes
-    ids, ints = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
+    ids, ints, _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
     mismatches = validate_top_k_neighbors_2d_zz(
         boxes, intensities, ids, ints, top_k=3,
         indices=np.arange(4),
@@ -255,7 +255,7 @@ def test_top_k_validated_against_brute_force(zz_boxes):
 def test_dense_to_csr_basic(zz_boxes):
     """CSR offsets indexed by box position (no precursor_idxs)."""
     boxes, intensities = zz_boxes
-    ids, ints = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
+    ids, ints, _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
     offsets, flat_ids, flat_ints = dense_neighbors_to_csr(ids, ints)
 
     assert len(offsets) == 5
@@ -275,10 +275,10 @@ def test_dense_to_csr_precursor_idxs(zz_boxes):
     boxes, intensities = zz_boxes
     # sparse precursor indices: boxes 0..3 → prec ids 10,20,30,40
     pidxs = np.array([10, 20, 30, 40], dtype=np.int32)
-    ids, ints = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3, precursor_idxs=pidxs)
-    offsets, flat_ids, _ = dense_neighbors_to_csr(ids, ints, precursor_idxs=pidxs)
+    ids, ints, prec_to_row = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3, precursor_idxs=pidxs)
+    offsets, flat_ids, _ = dense_neighbors_to_csr(ids, ints, prec_to_row=prec_to_row)
 
-    # offsets has size max(pidxs)+2 = 42; direct indexing by precursor_idx value
+    # offsets has size len(prec_to_row)+1 = max(pidxs)+2 = 42
     assert len(offsets) == 42
 
     def row(prec_idx):
@@ -303,7 +303,7 @@ def test_dense_to_csr_no_neighbors():
         [100, 110, 100, 110, 0, 50],
     ], dtype=np.int64)
     intensities = np.array([100, 200], dtype=np.int64)
-    ids, ints = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
+    ids, ints, _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
     offsets, flat_ids = dense_neighbors_to_csr(ids)
     assert list(offsets) == [0, 0, 0]
     assert len(flat_ids) == 0
@@ -313,7 +313,7 @@ def test_top_k_validate_with_precursor_idxs(zz_boxes):
     """validate_top_k_neighbors_2d_zz accepts precursor_idxs and reports no mismatches."""
     boxes, intensities = zz_boxes
     pidxs = np.array([10, 20, 30, 40], dtype=np.int32)
-    ids, ints = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3, precursor_idxs=pidxs)
+    ids, ints, _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3, precursor_idxs=pidxs)
     mismatches = validate_top_k_neighbors_2d_zz(
         boxes, intensities, ids, ints, top_k=3,
         indices=np.arange(4),
@@ -327,8 +327,8 @@ def test_top_k_precursor_idxs(zz_boxes):
     boxes, intensities = zz_boxes
     pidxs = np.array([10, 20, 30, 40], dtype=np.int32)
 
-    ids_prec, _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3, precursor_idxs=pidxs)
-    ids_box,  _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
+    ids_prec, _, _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3, precursor_idxs=pidxs)
+    ids_box,  _, _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
 
     valid_prec = set(int(x) for x in ids_prec[ids_prec >= 0])
     valid_box  = set(int(x) for x in ids_box[ids_box >= 0])
