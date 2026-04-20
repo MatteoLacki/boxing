@@ -454,10 +454,14 @@ def visit_box_intersections_2d_zz(
         n_in_bx = xx_starts[bx + 1] - xx_starts[bx]
         for idx in range(xx_starts[bx], xx_starts[bx + 1]):
             i = np.int64(box_order[idx])
+            xb = boxes[i, 0]; xe = boxes[i, 1]
+            yb = boxes[i, 2]; ye = boxes[i, 3]
+            zb = boxes[i, 4]; ze = boxes[i, 5]
+
             first_xx_bucket = np.int64(bx)
-            last_xx_bucket  = np.int64(math.ceil(boxes[i, 1] / xx_bucket_width)) - np.int64(1)
+            last_xx_bucket  = np.int64(math.ceil(xe / xx_bucket_width)) - np.int64(1)
             first_yy_bucket = first_yy_all[i]
-            last_yy_bucket  = np.int64(math.ceil(boxes[i, 3] / yy_bucket_width)) - np.int64(1)
+            last_yy_bucket  = np.int64(math.ceil(ye / yy_bucket_width)) - np.int64(1)
 
             last_xx_bucket  = min(last_xx_bucket,  np.int64(n_xx_buckets - 1))
             first_yy_bucket = max(first_yy_bucket, np.int64(0))
@@ -479,14 +483,17 @@ def visit_box_intersections_2d_zz(
                             canonical_by = max(first_yy_bucket, first_yy_all[j])
                             if xx_bucket_idx != canonical_bx or yy_bucket_idx != canonical_by:
                                 continue
-                        if (boxes[i, 0] < boxes[j, 1] and boxes[j, 0] < boxes[i, 1] and
-                                boxes[i, 2] < boxes[j, 3] and boxes[j, 2] < boxes[i, 3] and
-                                boxes[i, 4] < boxes[j, 5] and boxes[j, 4] < boxes[i, 5]):
+                        xbj = boxes[j, 0]; xej = boxes[j, 1]
+                        ybj = boxes[j, 2]; yej = boxes[j, 3]
+                        zbj = boxes[j, 4]; zej = boxes[j, 5]
+                        if (xb < xej and xbj < xe and
+                                yb < yej and ybj < ye and
+                                zb < zej and zbj < ze):
                             passes = True
                             if MAX_R2 < math.inf:
-                                d_xx = (boxes[i, 0] + boxes[i, 1] - boxes[j, 0] - boxes[j, 1]) / (boxes[i, 1] - boxes[i, 0] + boxes[j, 1] - boxes[j, 0])
-                                d_yy = (boxes[i, 2] + boxes[i, 3] - boxes[j, 2] - boxes[j, 3]) / (boxes[i, 3] - boxes[i, 2] + boxes[j, 3] - boxes[j, 2])
-                                d_zz = (boxes[i, 4] + boxes[i, 5] - boxes[j, 4] - boxes[j, 5]) / (boxes[i, 5] - boxes[i, 4] + boxes[j, 5] - boxes[j, 4])
+                                d_xx = (xb + xe - xbj - xej) / (xe - xb + xej - xbj)
+                                d_yy = (yb + ye - ybj - yej) / (ye - yb + yej - ybj)
+                                d_zz = (zb + ze - zbj - zej) / (ze - zb + zej - zbj)
                                 passes = d_xx * d_xx + d_yy * d_yy + d_zz * d_zz <= MAX_R2
                             if passes:
                                 processor(i, j, *processor_args)
