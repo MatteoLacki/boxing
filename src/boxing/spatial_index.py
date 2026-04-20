@@ -691,12 +691,17 @@ def _top_k_neighbors_processor(
     neighbor_ints: NDArray,
     intensities: NDArray,
     sort_perm: NDArray,
+    prec_idxs_s: NDArray,
 ) -> None:
     """Insert neighbor j into the top-k table for box i (min-intensity eviction).
 
-    neighbor_ids, neighbor_ints : int32/int64 [N, top_k] indexed by original i.
-    intensities : int64[N] in sorted order.
-    sort_perm   : box_order (sorted → original).
+    neighbor_ids, neighbor_ints : int32/int64 [N, top_k] indexed by original box i.
+    intensities  : int64[N] in sorted order.
+    sort_perm    : box_order (sorted → original box index) — used to address rows
+                   in neighbor_ids/neighbor_ints.
+    prec_idxs_s  : int32[N] sorted by box_order; maps sorted j → precursor index.
+                   When no precursor remapping is needed, pass box_order itself so
+                   prec_idxs_s[j] == original box index.
 
     Zero is the empty-slot sentinel in neighbor_ints — neighbors with intensity
     zero are never inserted.  Safe for ion-count data where zero means no signal.
@@ -705,7 +710,7 @@ def _top_k_neighbors_processor(
     new_intensity = intensities[j]
     if new_intensity == np.int64(0):
         return
-    new_id = np.int32(sort_perm[j])
+    new_id = np.int32(prec_idxs_s[j])
     top_k = neighbor_ids.shape[1]
 
     min_intensity = neighbor_ints[orig_i, 0]
@@ -729,6 +734,7 @@ def find_top_k_neighbors_2d_zz(
     yy_factor: float = 2.0,
     progress=None,
     ellipsoid_radius: float = math.inf,
+    precursor_idxs: NDArray | None = None,
 ) -> tuple[NDArray, NDArray]:
     """Return the top-k most intense neighbors per box, using a 2D index + zz filter.
 
@@ -736,11 +742,15 @@ def find_top_k_neighbors_2d_zz(
         A pair (i, j) is a candidate when all three axes overlap.
     intensities : int64-compatible array of length N — intensity of each box in
         original order.  Zero-intensity boxes are never recorded as neighbors.
+    precursor_idxs : int32-compatible array of length N or None.
+        Maps box index → precursor index.  When provided, neighbor_ids entries
+        contain precursor indices rather than box indices.  When None, defaults
+        to np.arange(N) so neighbor_ids contains box indices (original behavior).
 
     Returns
     -------
-    neighbor_ids  : int32[N, top_k]  — original box ids of the top-k neighbors;
-        unused slots contain -1.
+    neighbor_ids  : int32[N, top_k]  — precursor (or box) ids of the top-k
+        neighbors; unused slots contain -1.
     neighbor_ints : int64[N, top_k]  — corresponding intensities; unused slots
         contain 0.
 
@@ -756,6 +766,12 @@ def find_top_k_neighbors_2d_zz(
 
     intensities_s = np.asarray(intensities, dtype=np.int64)[box_order]
 
+    if precursor_idxs is None:
+        precursor_idxs = np.arange(N, dtype=np.int32)
+    else:
+        precursor_idxs = np.asarray(precursor_idxs, dtype=np.int32)
+    precursor_idxs_s = precursor_idxs[box_order]
+
     neighbor_ids  = np.full((N, top_k), -1, dtype=np.int32)
     neighbor_ints = np.zeros((N, top_k), dtype=np.int64)
 
@@ -763,8 +779,35 @@ def find_top_k_neighbors_2d_zz(
         boxes_s, fxa_s, fya_s, xx_starts, box_order_id,
         row_starts, cell_offsets, flat_members, bw_xx, bw_yy,
         _top_k_neighbors_processor,
-        (neighbor_ids, neighbor_ints, intensities_s, box_order),
+        (neighbor_ids, neighbor_ints, intensities_s, box_order, precursor_idxs_s),
         progress, ellipsoid_radius,
     )
 
     return neighbor_ids, neighbor_ints
+
+
+def dense_neighbors_to_csr(
+    neighbor_ids: NDArray,
+    neighbor_ints: NDArray | None = None,
+):
+    """Convert dense (N, K) top-k neighbor arrays to CSR format, skipping empty slots.
+
+    neighbor_ids  : int32[N, K]  — neighbor (or precursor) indices; -1 = empty slot.
+    neighbor_ints : int64[N, K] or None — corresponding intensities.
+
+    Returns
+    -------
+    offsets  : int64[N + 1]
+    flat_ids : same dtype as neighbor_ids, shape (M,)
+    flat_ints: same dtype as neighbor_ints, shape (M,)  — only when neighbor_ints given
+
+    offsets[i]:offsets[i+1] is the slice of flat_ids/flat_ints for row i.
+    """
+    valid = neighbor_ids >= 0
+    counts = valid.sum(axis=1).astype(np.int64)
+    offsets = np.zeros(len(counts) + 1, dtype=np.int64)
+    np.cumsum(counts, out=offsets[1:])
+    flat_ids = neighbor_ids[valid]
+    if neighbor_ints is not None:
+        return offsets, flat_ids, neighbor_ints[valid]
+    return offsets, flat_ids

@@ -8,6 +8,7 @@ from boxing.spatial_index import (
     box_widths_2d,
     build_spatial_index_2d,
     count_cell_memberships,
+    dense_neighbors_to_csr,
     find_top_k_neighbors_2d_zz,
     get_cell_members,
     get_multiplied_median_bucket_widths,
@@ -244,3 +245,58 @@ def test_top_k_validated_against_brute_force(zz_boxes):
         indices=np.arange(4),
     )
     assert mismatches == [], mismatches
+
+
+# ---------------------------------------------------------------------------
+# dense_neighbors_to_csr
+# ---------------------------------------------------------------------------
+
+
+def test_dense_to_csr_basic(zz_boxes):
+    """CSR offsets and flat_ids match expected neighbor sets (with intensities)."""
+    boxes, intensities = zz_boxes
+    ids, ints = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
+    offsets, flat_ids, flat_ints = dense_neighbors_to_csr(ids, ints)
+
+    assert len(offsets) == 5
+    assert int(offsets[-1]) == len(flat_ids) == len(flat_ints)
+
+    def row(i):
+        return set(int(x) for x in flat_ids[offsets[i]:offsets[i+1]])
+
+    assert row(0) == {1, 3}
+    assert row(1) == {0, 3}
+    assert row(2) == {3}
+    assert row(3) == {0, 1, 2}
+
+
+def test_dense_to_csr_no_neighbors():
+    """Isolated boxes: offsets all zero, flat_ids empty."""
+    boxes = np.array([
+        [0,  10,   0,  10,  0, 50],
+        [100, 110, 100, 110, 0, 50],
+    ], dtype=np.int64)
+    intensities = np.array([100, 200], dtype=np.int64)
+    ids, ints = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
+    offsets, flat_ids = dense_neighbors_to_csr(ids)
+    assert list(offsets) == [0, 0, 0]
+    assert len(flat_ids) == 0
+
+
+def test_top_k_precursor_idxs(zz_boxes):
+    """precursor_idxs remaps recorded neighbor ids; no-arg call returns box ids."""
+    boxes, intensities = zz_boxes
+    pidxs = np.array([10, 20, 30, 40], dtype=np.int32)
+
+    ids_prec, _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3, precursor_idxs=pidxs)
+    ids_box,  _ = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3)
+
+    valid_prec = set(int(x) for x in ids_prec[ids_prec >= 0])
+    valid_box  = set(int(x) for x in ids_box[ids_box >= 0])
+
+    assert valid_prec <= {10, 20, 30, 40}
+    assert valid_box  <= {0, 1, 2, 3}
+
+    # spot-check: box 0 neighbors are {1,3} → precursor ids {20,40}
+    assert set(int(x) for x in ids_prec[0][ids_prec[0] >= 0]) == {20, 40}
+    assert set(int(x) for x in ids_box[0][ids_box[0] >= 0])   == {1, 3}
