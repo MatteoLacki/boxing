@@ -793,6 +793,7 @@ def dense_neighbors_to_csr(
     neighbor_ids: NDArray,
     neighbor_ints: NDArray | None = None,
     prec_to_row: NDArray | None = None,
+    out_path=None,
 ):
     """Convert dense (N, K) top-k neighbor arrays to CSR format, skipping empty slots.
 
@@ -804,32 +805,73 @@ def dense_neighbors_to_csr(
         len(prec_to_row)+1 and is directly indexed by precursor_idx:
             offsets[prec_idx]:offsets[prec_idx+1]  →  neighbors of prec_idx.
         When None, offsets[i]:offsets[i+1] gives the neighbors of box i.
+    out_path      : path-like or None.  When provided the path must not exist;
+        it is created and two mmappet datasets are written inside:
+            neighbors.mmappet  — columns prec_idx (int32) [+ intensity (int64)]
+            index.mmappet      — column offset (int64)
+        The returned flat_ids / flat_ints are the memory-mapped arrays from
+        those files (already filled), not in-RAM copies.
 
     Returns
     -------
     offsets  : int64[len(prec_to_row)+1 or N+1]
-    flat_ids : same dtype as neighbor_ids, shape (M,)
-    flat_ints: same dtype as neighbor_ints, shape (M,)  — only when neighbor_ints given
+    flat_ids : int32[M]
+    flat_ints: int64[M]  — only when neighbor_ints given
     """
+    # ---- compute source rows and offsets ----------------------------------------
     if prec_to_row is not None:
         present = np.where(prec_to_row >= 0)[0]   # prec_idx values, ascending
-        rows = prec_to_row[present]                # corresponding rows in neighbor_ids
-        reordered_ids = neighbor_ids[rows]         # (len(present), K) in prec_idx order
-        valid = reordered_ids >= 0
+        rows = prec_to_row[present]
+        src_ids  = neighbor_ids[rows]              # (P, K) in prec_idx order
+        src_ints = neighbor_ints[rows] if neighbor_ints is not None else None
+        valid = src_ids >= 0
         counts = valid.sum(axis=1).astype(np.int64)
         offsets = np.zeros(len(prec_to_row) + 1, dtype=np.int64)
         offsets[present + 1] = counts
         np.cumsum(offsets, out=offsets)
-        flat_ids = reordered_ids[valid]
-        if neighbor_ints is not None:
-            return offsets, flat_ids, neighbor_ints[rows][valid]
-        return offsets, flat_ids
     else:
+        src_ids  = neighbor_ids
+        src_ints = neighbor_ints
         valid = neighbor_ids >= 0
         counts = valid.sum(axis=1).astype(np.int64)
         offsets = np.zeros(len(counts) + 1, dtype=np.int64)
         np.cumsum(counts, out=offsets[1:])
-        flat_ids = neighbor_ids[valid]
+
+    M = int(offsets[-1])
+
+    # ---- allocate output buffers ------------------------------------------------
+    if out_path is not None:
+        import mmappet
+        from pathlib import Path as _Path
+        out_path = _Path(out_path)
+        if out_path.exists():
+            raise ValueError(f"out_path already exists: {out_path}")
+        out_path.mkdir(parents=True)
+
+        neighbors_scheme = mmappet.get_schema(prec_idx=neighbor_ids.dtype)
         if neighbor_ints is not None:
-            return offsets, flat_ids, neighbor_ints[valid]
-        return offsets, flat_ids
+            neighbors_scheme = mmappet.get_schema(
+                prec_idx=neighbor_ids.dtype, intensity=neighbor_ints.dtype,
+            )
+        neighbors_ds = mmappet.open_new_dataset_dct(
+            out_path / "neighbors.mmappet", scheme=neighbors_scheme, nrows=M,
+        )
+        flat_ids = neighbors_ds["prec_idx"]
+        flat_ints = neighbors_ds["intensity"] if neighbor_ints is not None else None
+
+        index_ds = mmappet.open_new_dataset_dct(
+            out_path / "index.mmappet",
+            scheme=mmappet.get_schema(offset=np.int64),
+            nrows=len(offsets),
+        )
+        index_ds["offset"][:] = offsets
+    else:
+        flat_ids = np.empty(M, dtype=neighbor_ids.dtype)
+        flat_ints = np.empty(M, dtype=neighbor_ints.dtype) if neighbor_ints is not None else None
+
+    # ---- fill flat arrays -------------------------------------------------------
+    flat_ids[:] = src_ids[valid]
+    if neighbor_ints is not None:
+        flat_ints[:] = src_ints[valid]
+        return offsets, flat_ids, flat_ints
+    return offsets, flat_ids
