@@ -425,12 +425,7 @@ def _build_xx_index(
 
 @numba.njit(parallel=True)
 def visit_box_intersections_2d_zz(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
-    zz_lo: NDArray,
-    zz_hi: NDArray,
+    boxes: NDArray,
     first_xx_all: NDArray,
     first_yy_all: NDArray,
     xx_starts: NDArray,
@@ -447,9 +442,8 @@ def visit_box_intersections_2d_zz(
 ) -> None:
     """Visit every intersecting (xx, yy, zz) box pair and call processor(i, j, *processor_args).
 
-    Same as visit_box_intersections_2d but a pair is only visited when
-    zz_lo[i] < zz_hi[j] and zz_lo[j] < zz_hi[i] also holds.
-    zz_lo, zz_hi : int64[N] in the same sorted order as xx/yy arrays.
+    boxes : float64[N, 6] sorted by first xx-bucket, columns [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi].
+    A pair is visited only when all three axes overlap (half-open intervals).
     ellipsoid_radius : if finite, applies a 3D normalised distance filter.
     """
     MAX_R2 = ellipsoid_radius * ellipsoid_radius
@@ -461,9 +455,9 @@ def visit_box_intersections_2d_zz(
         for idx in range(xx_starts[bx], xx_starts[bx + 1]):
             i = np.int64(box_order[idx])
             first_xx_bucket = np.int64(bx)
-            last_xx_bucket  = np.int64(math.ceil(xx_hi[i] / xx_bucket_width)) - np.int64(1)
+            last_xx_bucket  = np.int64(math.ceil(boxes[i, 1] / xx_bucket_width)) - np.int64(1)
             first_yy_bucket = first_yy_all[i]
-            last_yy_bucket  = np.int64(math.ceil(yy_hi[i] / yy_bucket_width)) - np.int64(1)
+            last_yy_bucket  = np.int64(math.ceil(boxes[i, 3] / yy_bucket_width)) - np.int64(1)
 
             last_xx_bucket  = min(last_xx_bucket,  np.int64(n_xx_buckets - 1))
             first_yy_bucket = max(first_yy_bucket, np.int64(0))
@@ -485,14 +479,14 @@ def visit_box_intersections_2d_zz(
                             canonical_by = max(first_yy_bucket, first_yy_all[j])
                             if xx_bucket_idx != canonical_bx or yy_bucket_idx != canonical_by:
                                 continue
-                        if (xx_lo[i] < xx_hi[j] and xx_lo[j] < xx_hi[i] and
-                                yy_lo[i] < yy_hi[j] and yy_lo[j] < yy_hi[i] and
-                                zz_lo[i] < zz_hi[j] and zz_lo[j] < zz_hi[i]):
+                        if (boxes[i, 0] < boxes[j, 1] and boxes[j, 0] < boxes[i, 1] and
+                                boxes[i, 2] < boxes[j, 3] and boxes[j, 2] < boxes[i, 3] and
+                                boxes[i, 4] < boxes[j, 5] and boxes[j, 4] < boxes[i, 5]):
                             passes = True
                             if MAX_R2 < math.inf:
-                                d_xx = (xx_lo[i] + xx_hi[i] - xx_lo[j] - xx_hi[j]) / (xx_hi[i] - xx_lo[i] + xx_hi[j] - xx_lo[j])
-                                d_yy = (yy_lo[i] + yy_hi[i] - yy_lo[j] - yy_hi[j]) / (yy_hi[i] - yy_lo[i] + yy_hi[j] - yy_lo[j])
-                                d_zz = float(zz_lo[i] + zz_hi[i] - zz_lo[j] - zz_hi[j]) / float(zz_hi[i] - zz_lo[i] + zz_hi[j] - zz_lo[j])
+                                d_xx = (boxes[i, 0] + boxes[i, 1] - boxes[j, 0] - boxes[j, 1]) / (boxes[i, 1] - boxes[i, 0] + boxes[j, 1] - boxes[j, 0])
+                                d_yy = (boxes[i, 2] + boxes[i, 3] - boxes[j, 2] - boxes[j, 3]) / (boxes[i, 3] - boxes[i, 2] + boxes[j, 3] - boxes[j, 2])
+                                d_zz = (boxes[i, 4] + boxes[i, 5] - boxes[j, 4] - boxes[j, 5]) / (boxes[i, 5] - boxes[i, 4] + boxes[j, 5] - boxes[j, 4])
                                 passes = d_xx * d_xx + d_yy * d_yy + d_zz * d_zz <= MAX_R2
                             if passes:
                                 processor(i, j, *processor_args)
@@ -502,24 +496,22 @@ def visit_box_intersections_2d_zz(
 
 
 def _setup_first_coordinate_left_side_sort(
-    xx_lo_raw: NDArray,
-    xx_hi_raw: NDArray,
-    yy_lo_raw: NDArray,
-    yy_hi_raw: NDArray,
+    boxes: NDArray,
     xx_factor: float,
     yy_factor: float,
 ):
     """Build the presorted spatial index; return all arrays needed by the kernels.
 
-    Accepts both integer and float box bounds.  The spatial index structure is
-    built from conservatively rounded integer bounds (floor lo, ceil hi) so
-    every bucket touched by a float box is included.  The original float arrays
-    are returned to the kernels so the intersection predicate uses exact values.
+    boxes : (N, 6) array [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi], any dtype.
+    The spatial index is built from conservatively rounded integer bounds (floor lo,
+    ceil hi) so every bucket touched by a float box is included.  The returned
+    boxes_s is a C-contiguous float64 copy sorted by first xx-bucket.
     """
-    xx_lo_f = np.asarray(xx_lo_raw, dtype=np.float64)
-    xx_hi_f = np.asarray(xx_hi_raw, dtype=np.float64)
-    yy_lo_f = np.asarray(yy_lo_raw, dtype=np.float64)
-    yy_hi_f = np.asarray(yy_hi_raw, dtype=np.float64)
+    boxes_f = np.asarray(boxes, dtype=np.float64)
+    xx_lo_f = boxes_f[:, 0]
+    xx_hi_f = boxes_f[:, 1]
+    yy_lo_f = boxes_f[:, 2]
+    yy_hi_f = boxes_f[:, 3]
 
     xx_widths = xx_hi_f - xx_lo_f
     yy_widths = yy_hi_f - yy_lo_f
@@ -533,13 +525,12 @@ def _setup_first_coordinate_left_side_sort(
 
     xx_starts, box_order = _build_xx_index(first_xx_all, n_xx)
 
-    # Sort original float arrays by first_xx bucket.
-    xx_s  = xx_lo_f[box_order];        xxh_s = xx_hi_f[box_order]
-    yy_s  = yy_lo_f[box_order];        yyh_s = yy_hi_f[box_order]
-    fxa_s = first_xx_all[box_order];   fya_s = first_yy_all[box_order]
+    # Fancy-index produces a new C-contiguous (N, 6) float64 array sorted by first_xx.
+    boxes_s = boxes_f[box_order]
+    fxa_s = first_xx_all[box_order]
+    fya_s = first_yy_all[box_order]
 
-    # Build the spatial index structure using conservatively rounded integer bounds
-    # (floor lo, ceil hi) so every cell the float box might touch is registered.
+    # Build the spatial index from conservatively rounded integer bounds.
     xx_lo_idx = np.maximum(np.floor(xx_lo_f), 0).astype(np.int64).astype(np.uint32)
     xx_hi_idx = np.ceil(xx_hi_f).astype(np.int64).astype(np.uint32)
     yy_lo_idx = np.maximum(np.floor(yy_lo_f), 0).astype(np.int64).astype(np.uint32)
@@ -552,9 +543,9 @@ def _setup_first_coordinate_left_side_sort(
         boxes_idx, bw_xx, bw_yy, n_xx, n_yy,
     )
 
-    box_order_id = np.arange(len(xx_lo_f), dtype=np.int32)
+    box_order_id = np.arange(len(boxes_f), dtype=np.int32)
     return (
-        xx_s, xxh_s, yy_s, yyh_s,
+        boxes_s,
         fxa_s, fya_s,
         xx_starts, box_order_id,
         row_starts, cell_offsets, flat_members,
@@ -581,24 +572,16 @@ def count_intersections_2d_zz(
 
     Returns int32[N].
     """
-    boxes = np.asarray(boxes)
-    xx_lo = np.ascontiguousarray(boxes[:, 0])
-    xx_hi = np.ascontiguousarray(boxes[:, 1])
-    yy_lo = np.ascontiguousarray(boxes[:, 2])
-    yy_hi = np.ascontiguousarray(boxes[:, 3])
-    zz_lo = np.ascontiguousarray(boxes[:, 4])
-    zz_hi = np.ascontiguousarray(boxes[:, 5])
-    out = _setup_first_coordinate_left_side_sort(xx_lo, xx_hi, yy_lo, yy_hi, xx_factor, yy_factor)
-    *kernel_args, box_order = out
+    boxes = np.asarray(boxes, dtype=np.float64)
+    out = _setup_first_coordinate_left_side_sort(boxes, xx_factor, yy_factor)
+    boxes_s, fxa_s, fya_s, xx_starts, box_order_id, \
+        row_starts, cell_offsets, flat_members, bw_xx, bw_yy, box_order = out
 
-    zz_lo_s = np.asarray(zz_lo, dtype=np.int64)[box_order]
-    zz_hi_s = np.asarray(zz_hi, dtype=np.int64)[box_order]
-
-    xx_s, xxh_s, yy_s, yyh_s, *rest = kernel_args
     n_boxes = len(box_order)
     counts_sorted = np.zeros(n_boxes, dtype=np.int32)
     visit_box_intersections_2d_zz(
-        xx_s, xxh_s, yy_s, yyh_s, zz_lo_s, zz_hi_s, *rest,
+        boxes_s, fxa_s, fya_s, xx_starts, box_order_id,
+        row_starts, cell_offsets, flat_members, bw_xx, bw_yy,
         _count_processor, (counts_sorted,), progress, ellipsoid_radius,
     )
     counts = np.empty_like(counts_sorted)
@@ -659,26 +642,13 @@ def find_neighbors_2d_zz(
     The adjacency is symmetric: j in neighbors[offsets[i]:offsets[i+1]]
     implies i in neighbors[offsets[j]:offsets[j+1]].
     """
-    boxes = np.asarray(boxes)
-    xx_lo_f = np.ascontiguousarray(boxes[:, 0], dtype=np.float64)
-    xx_hi_f = np.ascontiguousarray(boxes[:, 1], dtype=np.float64)
-    yy_lo_f = np.ascontiguousarray(boxes[:, 2], dtype=np.float64)
-    yy_hi_f = np.ascontiguousarray(boxes[:, 3], dtype=np.float64)
-    zz_lo_f = np.ascontiguousarray(boxes[:, 4], dtype=np.float64)
-    zz_hi_f = np.ascontiguousarray(boxes[:, 5], dtype=np.float64)
+    boxes = np.asarray(boxes, dtype=np.float64)
+    N = len(boxes)
+    out = _setup_first_coordinate_left_side_sort(boxes, xx_factor, yy_factor)
+    boxes_s, fxa_s, fya_s, xx_starts, box_order_id, \
+        row_starts, cell_offsets, flat_members, bw_xx, bw_yy, box_order = out
 
-    N = len(xx_lo_f)
-    out = _setup_first_coordinate_left_side_sort(xx_lo_f, xx_hi_f, yy_lo_f, yy_hi_f, xx_factor, yy_factor)
-    *kernel_args, box_order = out
-
-    xx_s, xxh_s, yy_s, yyh_s, fxa_s, fya_s, xx_starts, box_order_id, \
-        row_starts, cell_offsets, flat_members, bw_xx, bw_yy = kernel_args
-
-    zz_lo_s = zz_lo_f[box_order]
-    zz_hi_s = zz_hi_f[box_order]
-
-    _zz_kernel_args = (xx_s, xxh_s, yy_s, yyh_s, zz_lo_s, zz_hi_s,
-                       fxa_s, fya_s, xx_starts, box_order_id,
+    _zz_kernel_args = (boxes_s, fxa_s, fya_s, xx_starts, box_order_id,
                        row_starts, cell_offsets, flat_members, bw_xx, bw_yy)
 
     # --- count pass ---
@@ -782,30 +752,19 @@ def find_top_k_neighbors_2d_zz(
     Result is not sorted within each row; sort by neighbor_ints[i] descending
     if order matters.
     """
-    boxes = np.asarray(boxes)
-    xx_lo = np.ascontiguousarray(boxes[:, 0], dtype=np.float64)
-    xx_hi = np.ascontiguousarray(boxes[:, 1], dtype=np.float64)
-    yy_lo = np.ascontiguousarray(boxes[:, 2], dtype=np.float64)
-    yy_hi = np.ascontiguousarray(boxes[:, 3], dtype=np.float64)
-    zz_lo = np.ascontiguousarray(boxes[:, 4], dtype=np.float64)
-    zz_hi = np.ascontiguousarray(boxes[:, 5], dtype=np.float64)
-    N = len(xx_lo)
-    out = _setup_first_coordinate_left_side_sort(xx_lo, xx_hi, yy_lo, yy_hi, xx_factor, yy_factor)
-    *kernel_args, box_order = out
+    boxes = np.asarray(boxes, dtype=np.float64)
+    N = len(boxes)
+    out = _setup_first_coordinate_left_side_sort(boxes, xx_factor, yy_factor)
+    boxes_s, fxa_s, fya_s, xx_starts, box_order_id, \
+        row_starts, cell_offsets, flat_members, bw_xx, bw_yy, box_order = out
 
-    xx_s, xxh_s, yy_s, yyh_s, fxa_s, fya_s, xx_starts, box_order_id, \
-        row_starts, cell_offsets, flat_members, bw_xx, bw_yy = kernel_args
-
-    zz_lo_s = np.asarray(zz_lo, dtype=np.int64)[box_order]
-    zz_hi_s = np.asarray(zz_hi, dtype=np.int64)[box_order]
     intensities_s = np.asarray(intensities, dtype=np.int64)[box_order]
 
     neighbor_ids  = np.full((N, top_k), -1, dtype=np.int32)
     neighbor_ints = np.zeros((N, top_k), dtype=np.int64)
 
     visit_box_intersections_2d_zz(
-        xx_s, xxh_s, yy_s, yyh_s, zz_lo_s, zz_hi_s,
-        fxa_s, fya_s, xx_starts, box_order_id,
+        boxes_s, fxa_s, fya_s, xx_starts, box_order_id,
         row_starts, cell_offsets, flat_members, bw_xx, bw_yy,
         _top_k_neighbors_processor,
         (neighbor_ids, neighbor_ints, intensities_s, box_order),
