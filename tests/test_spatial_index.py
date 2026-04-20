@@ -13,6 +13,7 @@ from boxing.spatial_index import (
     get_multiplied_median_bucket_widths,
     validate_boxes_2d,
 )
+from boxing.testing import validate_top_k_neighbors_2d_zz
 
 
 # ---------------------------------------------------------------------------
@@ -290,3 +291,17 @@ def test_self_intersection_count_on_real_data():
     assert len(fm) > 0
     assert total_pairs > 0
     assert rs[-1] == len(fm)  # row_starts[-1] == total members
+
+
+def test_top_k_validated_against_brute_force(zz_boxes):
+    """find_top_k_neighbors_2d_zz result matches brute-force on all 4 boxes."""
+    xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi, intensities = zz_boxes
+    ids, ints = find_top_k_neighbors_2d_zz(
+        xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi, intensities, top_k=3,
+    )
+    mismatches = validate_top_k_neighbors_2d_zz(
+        xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi,
+        intensities, ids, ints, top_k=3,
+        indices=np.arange(4),
+    )
+    assert mismatches == [], mismatches
