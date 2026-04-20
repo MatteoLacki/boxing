@@ -808,15 +808,26 @@ def dense_neighbors_to_csr(
     flat_ints: same dtype as neighbor_ints, shape (M,)  — only when neighbor_ints given
     """
     if precursor_idxs is not None:
-        perm = np.argsort(precursor_idxs)   # perm[k] = box idx for the k-th prec_idx
+        pidxs = np.asarray(precursor_idxs)
+        perm = np.argsort(pidxs)            # rows sorted by precursor_idx value
         neighbor_ids = neighbor_ids[perm]
         if neighbor_ints is not None:
             neighbor_ints = neighbor_ints[perm]
+        sorted_pidxs = pidxs[perm]
 
-    valid = neighbor_ids >= 0
-    counts = valid.sum(axis=1).astype(np.int64)
-    offsets = np.zeros(len(counts) + 1, dtype=np.int64)
-    np.cumsum(counts, out=offsets[1:])
+        valid = neighbor_ids >= 0
+        counts = valid.sum(axis=1).astype(np.int64)
+
+        # offsets indexed by precursor_idx value — size max(prec_idx)+2
+        offsets = np.zeros(int(sorted_pidxs[-1]) + 2, dtype=np.int64)
+        offsets[sorted_pidxs + 1] = counts
+        np.cumsum(offsets, out=offsets)
+    else:
+        valid = neighbor_ids >= 0
+        counts = valid.sum(axis=1).astype(np.int64)
+        offsets = np.zeros(len(counts) + 1, dtype=np.int64)
+        np.cumsum(counts, out=offsets[1:])
+
     flat_ids = neighbor_ids[valid]
     if neighbor_ints is not None:
         return offsets, flat_ids, neighbor_ints[valid]

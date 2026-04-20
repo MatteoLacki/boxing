@@ -271,29 +271,29 @@ def test_dense_to_csr_basic(zz_boxes):
 
 
 def test_dense_to_csr_precursor_idxs(zz_boxes):
-    """With precursor_idxs, offsets[prec_idx] gives the correct neighbors."""
+    """With sparse precursor_idxs, offsets[prec_idx] gives the correct neighbors."""
     boxes, intensities = zz_boxes
+    # sparse precursor indices: boxes 0..3 → prec ids 10,20,30,40
     pidxs = np.array([10, 20, 30, 40], dtype=np.int32)
     ids, ints = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3, precursor_idxs=pidxs)
-    # pidxs is NOT a permutation of 0..3, so we pass a simple permutation for indexing
-    # Use pidxs=[3,1,2,0] so offsets[0]=box3, offsets[1]=box1, offsets[2]=box2, offsets[3]=box0
-    pidxs_perm = np.array([3, 1, 2, 0], dtype=np.int32)
-    ids2, ints2 = find_top_k_neighbors_2d_zz(boxes, intensities, top_k=3, precursor_idxs=pidxs_perm)
-    offsets, flat_ids, _ = dense_neighbors_to_csr(ids2, ints2, precursor_idxs=pidxs_perm)
+    offsets, flat_ids, _ = dense_neighbors_to_csr(ids, ints, precursor_idxs=pidxs)
 
-    assert len(offsets) == 5
+    # offsets has size max(pidxs)+2 = 42; direct indexing by precursor_idx value
+    assert len(offsets) == 42
 
     def row(prec_idx):
         return set(int(x) for x in flat_ids[offsets[prec_idx]:offsets[prec_idx+1]])
 
-    # prec_idx 0 → box 3 → neighbors {0,1,2} (mapped to pidxs_perm {3,1,2})
-    assert row(0) == {3, 1, 2}
-    # prec_idx 1 → box 1 → neighbors {0,3} (mapped to pidxs_perm {3,0})
-    assert row(1) == {3, 0}
-    # prec_idx 2 → box 2 → neighbors {3} (mapped to pidxs_perm {0})
-    assert row(2) == {0}
-    # prec_idx 3 → box 0 → neighbors {1,3} (mapped to pidxs_perm {1,0})
-    assert row(3) == {1, 0}
+    # box 0 (prec 10) neighbors: {1,3} → prec ids {20,40}
+    assert row(10) == {20, 40}
+    # box 1 (prec 20) neighbors: {0,3} → prec ids {10,40}
+    assert row(20) == {10, 40}
+    # box 2 (prec 30) neighbors: {3} → prec ids {40}
+    assert row(30) == {40}
+    # box 3 (prec 40) neighbors: {0,1,2} → prec ids {10,20,30}
+    assert row(40) == {10, 20, 30}
+    # gaps are empty
+    assert row(15) == set()
 
 
 def test_dense_to_csr_no_neighbors():
