@@ -88,10 +88,7 @@ def get_multiplied_median_bucket_widths(
 
 @numba.njit(boundscheck=True)
 def _count_cell_memberships_numba(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
+    boxes: NDArray,
     xx_bucket_width: np.int64,
     yy_bucket_width: np.int64,
     n_xx_buckets: np.int64,
@@ -100,8 +97,8 @@ def _count_cell_memberships_numba(
 ) -> None:
     """Increment counts_2d[bx, by] for every (bx, by) cell each box overlaps.
 
-    Inputs must be contiguous uint32 arrays. counts_2d is int64[BX, BY],
-    modified in-place.
+    boxes : int32[N, 4] with columns [xx_lo, xx_hi, yy_lo, yy_hi].
+    counts_2d : int64[BX, BY], modified in-place.
 
     Bucket assignment (half-open intervals):
         first_bucket = lo // width
@@ -109,12 +106,13 @@ def _count_cell_memberships_numba(
 
     Bucket IDs are clamped to [0, n_*_buckets - 1].
     """
-    n_boxes = len(xx_lo)
-    for i in range(n_boxes):
-        first_xx_bucket = np.int64(xx_lo[i]) // xx_bucket_width
-        last_xx_bucket = (np.int64(xx_hi[i]) - np.int64(1)) // xx_bucket_width
-        first_yy_bucket = np.int64(yy_lo[i]) // yy_bucket_width
-        last_yy_bucket = (np.int64(yy_hi[i]) - np.int64(1)) // yy_bucket_width
+    for i in range(len(boxes)):
+        xb = np.int64(boxes[i, 0]); xe = np.int64(boxes[i, 1])
+        yb = np.int64(boxes[i, 2]); ye = np.int64(boxes[i, 3])
+        first_xx_bucket = xb // xx_bucket_width
+        last_xx_bucket  = (xe - np.int64(1)) // xx_bucket_width
+        first_yy_bucket = yb // yy_bucket_width
+        last_yy_bucket  = (ye - np.int64(1)) // yy_bucket_width
 
         if first_xx_bucket < np.int64(0):
             first_xx_bucket = np.int64(0)
@@ -151,14 +149,10 @@ def count_cell_memberships(
            [1, 1, 0],
            [0, 0, 0]])
     """
-    boxes = np.asarray(boxes, dtype=np.int64)
-    xx_lo_u32 = np.ascontiguousarray(np.clip(boxes[:, 0], 0, None), dtype=np.uint32)
-    xx_hi_u32 = np.ascontiguousarray(boxes[:, 1], dtype=np.uint32)
-    yy_lo_u32 = np.ascontiguousarray(np.clip(boxes[:, 2], 0, None), dtype=np.uint32)
-    yy_hi_u32 = np.ascontiguousarray(boxes[:, 3], dtype=np.uint32)
+    boxes = np.ascontiguousarray(boxes, dtype=np.int32)
     counts = np.zeros((n_xx_buckets, n_yy_buckets), dtype=np.int64)
     _count_cell_memberships_numba(
-        xx_lo_u32, xx_hi_u32, yy_lo_u32, yy_hi_u32,
+        boxes,
         np.int64(xx_bucket_width), np.int64(yy_bucket_width),
         np.int64(n_xx_buckets), np.int64(n_yy_buckets),
         counts,
@@ -201,10 +195,7 @@ def _build_offsets(
 
 @numba.njit(boundscheck=True)
 def _fill_memberships_numba(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
+    boxes: NDArray,
     xx_bucket_width: np.int64,
     yy_bucket_width: np.int64,
     n_xx_buckets: np.int64,
@@ -216,17 +207,19 @@ def _fill_memberships_numba(
 ) -> None:
     """Write box index i into flat_members for every cell it overlaps.
 
-    cursors is an int64[BX, BY] scratch array, zero-initialised before call.
+    boxes : int32[N, 4] with columns [xx_lo, xx_hi, yy_lo, yy_hi].
+    cursors : int64[BX, BY] scratch array, zero-initialised before call.
     For each (bx, by) the write position is:
         pos = row_starts[bx] + cell_offsets[bx, by] + cursors[bx, by]
     cursors[bx, by] is post-incremented after each write.
     """
-    n_boxes = len(xx_lo)
-    for i in range(n_boxes):
-        first_xx_bucket = np.int64(xx_lo[i]) // xx_bucket_width
-        last_xx_bucket = (np.int64(xx_hi[i]) - np.int64(1)) // xx_bucket_width
-        first_yy_bucket = np.int64(yy_lo[i]) // yy_bucket_width
-        last_yy_bucket = (np.int64(yy_hi[i]) - np.int64(1)) // yy_bucket_width
+    for i in range(len(boxes)):
+        xb = np.int64(boxes[i, 0]); xe = np.int64(boxes[i, 1])
+        yb = np.int64(boxes[i, 2]); ye = np.int64(boxes[i, 3])
+        first_xx_bucket = xb // xx_bucket_width
+        last_xx_bucket  = (xe - np.int64(1)) // xx_bucket_width
+        first_yy_bucket = yb // yy_bucket_width
+        last_yy_bucket  = (ye - np.int64(1)) // yy_bucket_width
 
         if first_xx_bucket < np.int64(0):
             first_xx_bucket = np.int64(0)
@@ -299,15 +292,11 @@ def build_spatial_index_2d(
     if yy_bucket_width <= 0:
         raise ValueError(f"yy_bucket_width must be > 0, got {yy_bucket_width}")
 
-    boxes = np.asarray(boxes, dtype=np.int64)
-    xx_lo_u32 = np.ascontiguousarray(np.clip(boxes[:, 0], 0, None), dtype=np.uint32)
-    xx_hi_u32 = np.ascontiguousarray(boxes[:, 1], dtype=np.uint32)
-    yy_lo_u32 = np.ascontiguousarray(np.clip(boxes[:, 2], 0, None), dtype=np.uint32)
-    yy_hi_u32 = np.ascontiguousarray(boxes[:, 3], dtype=np.uint32)
+    boxes = np.ascontiguousarray(boxes, dtype=np.int32)
 
     counts = np.zeros((n_xx_buckets, n_yy_buckets), dtype=np.int64)
     _count_cell_memberships_numba(
-        xx_lo_u32, xx_hi_u32, yy_lo_u32, yy_hi_u32,
+        boxes,
         np.int64(xx_bucket_width), np.int64(yy_bucket_width),
         np.int64(n_xx_buckets), np.int64(n_yy_buckets),
         counts,
@@ -319,7 +308,7 @@ def build_spatial_index_2d(
     flat_members = np.empty(total_members, dtype=np.int32)
     cursors = np.zeros((n_xx_buckets, n_yy_buckets), dtype=np.int64)
     _fill_memberships_numba(
-        xx_lo_u32, xx_hi_u32, yy_lo_u32, yy_hi_u32,
+        boxes,
         np.int64(xx_bucket_width), np.int64(yy_bucket_width),
         np.int64(n_xx_buckets), np.int64(n_yy_buckets),
         row_starts, cell_offsets, cursors, flat_members,
@@ -538,10 +527,10 @@ def _setup_first_coordinate_left_side_sort(
     fya_s = first_yy_all[box_order]
 
     # Build the spatial index from conservatively rounded integer bounds.
-    xx_lo_idx = np.maximum(np.floor(xx_lo_f), 0).astype(np.int64).astype(np.uint32)
-    xx_hi_idx = np.ceil(xx_hi_f).astype(np.int64).astype(np.uint32)
-    yy_lo_idx = np.maximum(np.floor(yy_lo_f), 0).astype(np.int64).astype(np.uint32)
-    yy_hi_idx = np.ceil(yy_hi_f).astype(np.int64).astype(np.uint32)
+    xx_lo_idx = np.floor(xx_lo_f).clip(0).astype(np.int32)
+    xx_hi_idx = np.ceil(xx_hi_f).astype(np.int32)
+    yy_lo_idx = np.floor(yy_lo_f).clip(0).astype(np.int32)
+    yy_hi_idx = np.ceil(yy_hi_f).astype(np.int32)
     boxes_idx = np.column_stack([
         xx_lo_idx[box_order], xx_hi_idx[box_order],
         yy_lo_idx[box_order], yy_hi_idx[box_order],
