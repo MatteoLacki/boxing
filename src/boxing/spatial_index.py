@@ -789,20 +789,30 @@ def find_top_k_neighbors_2d_zz(
 def dense_neighbors_to_csr(
     neighbor_ids: NDArray,
     neighbor_ints: NDArray | None = None,
+    precursor_idxs: NDArray | None = None,
 ):
     """Convert dense (N, K) top-k neighbor arrays to CSR format, skipping empty slots.
 
     neighbor_ids  : int32[N, K]  — neighbor (or precursor) indices; -1 = empty slot.
     neighbor_ints : int64[N, K] or None — corresponding intensities.
+    precursor_idxs : int array of length N or None.
+        When provided, offsets is indexed by precursor index so that
+        offsets[prec_idx]:offsets[prec_idx+1] gives the neighbors of precursor
+        prec_idx.  precursor_idxs must be a permutation of 0..N-1.
+        When None, offsets[i]:offsets[i+1] gives the neighbors of box i.
 
     Returns
     -------
     offsets  : int64[N + 1]
     flat_ids : same dtype as neighbor_ids, shape (M,)
     flat_ints: same dtype as neighbor_ints, shape (M,)  — only when neighbor_ints given
-
-    offsets[i]:offsets[i+1] is the slice of flat_ids/flat_ints for row i.
     """
+    if precursor_idxs is not None:
+        perm = np.argsort(precursor_idxs)   # perm[k] = box idx for the k-th prec_idx
+        neighbor_ids = neighbor_ids[perm]
+        if neighbor_ints is not None:
+            neighbor_ints = neighbor_ints[perm]
+
     valid = neighbor_ids >= 0
     counts = valid.sum(axis=1).astype(np.int64)
     offsets = np.zeros(len(counts) + 1, dtype=np.int64)
