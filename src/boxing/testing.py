@@ -8,29 +8,23 @@ from numpy.typing import NDArray
 
 def brute_force_top_k_neighbors_2d_zz(
     i: int,
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
-    zz_lo: NDArray,
-    zz_hi: NDArray,
+    boxes: NDArray,
     intensities: NDArray,
     top_k: int,
 ) -> list[int]:
     """Return exact top-k neighbour indices for box i by exhaustive search.
 
+    boxes : (N, 6) array with columns [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi].
     A neighbour j is any box (j != i) whose intervals overlap on all three axes.
     Among all neighbours, return the indices of the top_k with highest intensity.
     When there are fewer than top_k neighbours, return all of them.
     Tie-breaking at the boundary is arbitrary (argpartition order).
     """
-    xx_lo = np.asarray(xx_lo)
-    xx_hi = np.asarray(xx_hi)
-    yy_lo = np.asarray(yy_lo)
-    yy_hi = np.asarray(yy_hi)
-    zz_lo = np.asarray(zz_lo)
-    zz_hi = np.asarray(zz_hi)
+    boxes = np.asarray(boxes)
     intensities = np.asarray(intensities)
+    xx_lo, xx_hi = boxes[:, 0], boxes[:, 1]
+    yy_lo, yy_hi = boxes[:, 2], boxes[:, 3]
+    zz_lo, zz_hi = boxes[:, 4], boxes[:, 5]
 
     mask = (
         (xx_lo < xx_hi[i]) & (xx_lo[i] < xx_hi) &
@@ -47,12 +41,7 @@ def brute_force_top_k_neighbors_2d_zz(
 
 
 def validate_top_k_neighbors_2d_zz(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
-    zz_lo: NDArray,
-    zz_hi: NDArray,
+    boxes: NDArray,
     intensities: NDArray,
     neighbor_ids: NDArray,
     neighbor_ints: NDArray,
@@ -63,6 +52,8 @@ def validate_top_k_neighbors_2d_zz(
     seed: int = 42,
 ) -> list[tuple]:
     """Validate neighbor_ids / neighbor_ints against brute-force results.
+
+    boxes : (N, 6) array with columns [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi].
 
     Parameters
     ----------
@@ -83,15 +74,13 @@ def validate_top_k_neighbors_2d_zz(
     - No excluded neighbour strictly more intense than the weakest kept.
       (Ties at the boundary are allowed to break either way.)
     """
-    xx_lo = np.asarray(xx_lo)
-    xx_hi = np.asarray(xx_hi)
-    yy_lo = np.asarray(yy_lo)
-    yy_hi = np.asarray(yy_hi)
-    zz_lo = np.asarray(zz_lo)
-    zz_hi = np.asarray(zz_hi)
+    boxes = np.asarray(boxes)
     intensities = np.asarray(intensities)
+    xx_lo, xx_hi = boxes[:, 0], boxes[:, 1]
+    yy_lo, yy_hi = boxes[:, 2], boxes[:, 3]
+    zz_lo, zz_hi = boxes[:, 4], boxes[:, 5]
 
-    N = len(xx_lo)
+    N = len(boxes)
     if indices is None:
         rng = np.random.default_rng(seed)
         indices = rng.choice(N, size=K, replace=False)

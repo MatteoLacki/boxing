@@ -21,7 +21,6 @@ Cell (bx, by) access::
 Design notes
 ------------
 - Half-open intervals: box spans [lo, hi); last bucket = (hi - 1) // width.
-- Zero-width boxes (lo == hi on any axis) are rejected by validate_boxes_2d.
 - Bucket IDs are clamped to [0, n_*_buckets - 1].
 - Bucket widths <= 0 raise ValueError.
 - Two-pass CSR build: count → prefix-sum → fill.
@@ -40,78 +39,24 @@ from boxing.utils import count1D, argcountsort
 
 
 # ---------------------------------------------------------------------------
-# Validation and helpers (pure Python / NumPy)
+# Helpers (pure Python / NumPy)
 # ---------------------------------------------------------------------------
 
 
-def validate_boxes_2d(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
-) -> tuple[NDArray, NDArray, NDArray, NDArray]:
-    """Validate box arrays and return contiguous uint32 copies.
-
-    xx_lo/xx_hi, yy_lo/yy_hi : half-open [lo, hi) bounds for each box along
-    the two axes.  Any array dtype is accepted; negative lo values are clipped
-    to 0.  Zero-width boxes (lo >= hi) are rejected.
-
-    >>> import numpy as np
-    >>> xl = np.array([0, 10], dtype=np.uint32)
-    >>> xh = np.array([5, 20], dtype=np.uint32)
-    >>> yl = np.array([1,  3], dtype=np.uint32)
-    >>> yh = np.array([4,  8], dtype=np.uint32)
-    >>> out = validate_boxes_2d(xl, xh, yl, yh)
-    >>> [a.dtype for a in out]
-    [dtype('uint32'), dtype('uint32'), dtype('uint32'), dtype('uint32')]
-    """
-    # Validate in int64 to avoid uint32 wraparound masking genuine errors.
-    xx_lo_i64 = np.asarray(xx_lo, dtype=np.int64)
-    xx_hi_i64 = np.asarray(xx_hi, dtype=np.int64)
-    yy_lo_i64 = np.asarray(yy_lo, dtype=np.int64)
-    yy_hi_i64 = np.asarray(yy_hi, dtype=np.int64)
-    n = len(xx_lo_i64)
-    if not (len(xx_hi_i64) == len(yy_lo_i64) == len(yy_hi_i64) == n):
-        raise ValueError("All four arrays must have equal length.")
-    if np.any(xx_hi_i64 <= xx_lo_i64):
-        raise ValueError(
-            "Zero-width or inverted boxes on xx axis are not allowed "
-            "(require xx_hi > xx_lo)."
-        )
-    if np.any(yy_hi_i64 <= yy_lo_i64):
-        raise ValueError(
-            "Zero-width or inverted boxes on yy axis are not allowed "
-            "(require yy_hi > yy_lo)."
-        )
-    # Negative coordinates are clipped to 0: buckets start at 0 so any
-    # negative lo simply means the box starts before the grid origin.
-    xx_lo_u32 = np.ascontiguousarray(np.clip(xx_lo_i64, 0, None), dtype=np.uint32)
-    xx_hi_u32 = np.ascontiguousarray(xx_hi_i64, dtype=np.uint32)
-    yy_lo_u32 = np.ascontiguousarray(np.clip(yy_lo_i64, 0, None), dtype=np.uint32)
-    yy_hi_u32 = np.ascontiguousarray(yy_hi_i64, dtype=np.uint32)
-    return xx_lo_u32, xx_hi_u32, yy_lo_u32, yy_hi_u32
-
-
-def box_widths_2d(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
-) -> tuple[NDArray, NDArray]:
+def box_widths_2d(boxes: NDArray) -> tuple[NDArray, NDArray]:
     """Return per-box widths along xx and yy axes as int64.
 
-    xx_lo/xx_hi, yy_lo/yy_hi : raw box bounds (any dtype).
+    boxes : (N, 4) with columns [xx_lo, xx_hi, yy_lo, yy_hi].
     Casts to int64 before subtraction to avoid uint32 underflow.
 
     >>> import numpy as np
-    >>> xw, yw = box_widths_2d(
-    ...     np.array([10], dtype=np.uint32), np.array([15], dtype=np.uint32),
-    ...     np.array([3],  dtype=np.uint32), np.array([7],  dtype=np.uint32))
+    >>> xw, yw = box_widths_2d(np.array([[10, 15, 3, 7]], dtype=np.uint32))
     >>> int(xw[0]), int(yw[0])
     (5, 4)
     """
-    xx_widths = xx_hi.astype(np.int64) - xx_lo.astype(np.int64)
-    yy_widths = yy_hi.astype(np.int64) - yy_lo.astype(np.int64)
+    boxes = np.asarray(boxes)
+    xx_widths = boxes[:, 1].astype(np.int64) - boxes[:, 0].astype(np.int64)
+    yy_widths = boxes[:, 3].astype(np.int64) - boxes[:, 2].astype(np.int64)
     return xx_widths, yy_widths
 
 
@@ -186,10 +131,7 @@ def _count_cell_memberships_numba(
 
 
 def count_cell_memberships(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
+    boxes: NDArray,
     xx_bucket_width: int,
     yy_bucket_width: int,
     n_xx_buckets: int,
@@ -197,23 +139,23 @@ def count_cell_memberships(
 ) -> NDArray:
     """Return int64 count matrix of shape (n_xx_buckets, n_yy_buckets).
 
-    xx_lo/xx_hi, yy_lo/yy_hi : box bounds (any dtype).
+    boxes : (N, 4) with columns [xx_lo, xx_hi, yy_lo, yy_hi] (any dtype).
     xx_bucket_width, yy_bucket_width : bucket size along each axis (int, > 0).
     n_xx_buckets, n_yy_buckets : grid dimensions; out-of-range IDs are clamped.
 
     counts[bx, by] = number of boxes that overlap cell (bx, by).
 
     >>> import numpy as np
-    >>> xl = np.array([0], dtype=np.uint32)
-    >>> xh = np.array([3], dtype=np.uint32)
-    >>> yl = np.array([0], dtype=np.uint32)
-    >>> yh = np.array([3], dtype=np.uint32)
-    >>> count_cell_memberships(xl, xh, yl, yh, 2, 2, 3, 3)
+    >>> count_cell_memberships(np.array([[0, 3, 0, 3]], dtype=np.uint32), 2, 2, 3, 3)
     array([[1, 1, 0],
            [1, 1, 0],
            [0, 0, 0]])
     """
-    xx_lo_u32, xx_hi_u32, yy_lo_u32, yy_hi_u32 = validate_boxes_2d(xx_lo, xx_hi, yy_lo, yy_hi)
+    boxes = np.asarray(boxes, dtype=np.int64)
+    xx_lo_u32 = np.ascontiguousarray(np.clip(boxes[:, 0], 0, None), dtype=np.uint32)
+    xx_hi_u32 = np.ascontiguousarray(boxes[:, 1], dtype=np.uint32)
+    yy_lo_u32 = np.ascontiguousarray(np.clip(boxes[:, 2], 0, None), dtype=np.uint32)
+    yy_hi_u32 = np.ascontiguousarray(boxes[:, 3], dtype=np.uint32)
     counts = np.zeros((n_xx_buckets, n_yy_buckets), dtype=np.int64)
     _count_cell_memberships_numba(
         xx_lo_u32, xx_hi_u32, yy_lo_u32, yy_hi_u32,
@@ -310,10 +252,7 @@ def _fill_memberships_numba(
 
 
 def build_spatial_index_2d(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
+    boxes: NDArray,
     xx_bucket_width: int,
     yy_bucket_width: int,
     n_xx_buckets: int,
@@ -323,7 +262,7 @@ def build_spatial_index_2d(
 
     Parameters
     ----------
-    xx_lo, xx_hi, yy_lo, yy_hi : array-like
+    boxes : (N, 4) array-like with columns [xx_lo, xx_hi, yy_lo, yy_hi].
         Box bounds, half-open [lo, hi).  Converted to uint32 internally.
     xx_bucket_width, yy_bucket_width : int
         Size of each bucket along the respective axis.
@@ -345,14 +284,11 @@ def build_spatial_index_2d(
     Raises
     ------
     ValueError
-        If bucket_width <= 0 or any box has lo >= hi.
+        If bucket_width <= 0.
 
     >>> import numpy as np
-    >>> xl = np.array([0, 4], dtype=np.uint32)
-    >>> xh = np.array([3, 7], dtype=np.uint32)
-    >>> yl = np.array([0, 4], dtype=np.uint32)
-    >>> yh = np.array([3, 7], dtype=np.uint32)
-    >>> rs, co, fm = build_spatial_index_2d(xl, xh, yl, yh, 4, 4, 2, 2)
+    >>> boxes = np.array([[0, 3, 0, 3], [4, 7, 4, 7]], dtype=np.uint32)
+    >>> rs, co, fm = build_spatial_index_2d(boxes, 4, 4, 2, 2)
     >>> fm[rs[0]+co[0,0] : rs[0]+co[0,1]].tolist()
     [0]
     >>> fm[rs[1]+co[1,1] : rs[1]+co[1,2]].tolist()
@@ -363,7 +299,11 @@ def build_spatial_index_2d(
     if yy_bucket_width <= 0:
         raise ValueError(f"yy_bucket_width must be > 0, got {yy_bucket_width}")
 
-    xx_lo_u32, xx_hi_u32, yy_lo_u32, yy_hi_u32 = validate_boxes_2d(xx_lo, xx_hi, yy_lo, yy_hi)
+    boxes = np.asarray(boxes, dtype=np.int64)
+    xx_lo_u32 = np.ascontiguousarray(np.clip(boxes[:, 0], 0, None), dtype=np.uint32)
+    xx_hi_u32 = np.ascontiguousarray(boxes[:, 1], dtype=np.uint32)
+    yy_lo_u32 = np.ascontiguousarray(np.clip(boxes[:, 2], 0, None), dtype=np.uint32)
+    yy_hi_u32 = np.ascontiguousarray(boxes[:, 3], dtype=np.uint32)
 
     counts = np.zeros((n_xx_buckets, n_yy_buckets), dtype=np.int64)
     _count_cell_memberships_numba(
@@ -481,86 +421,6 @@ def _build_xx_index(
     xx_starts = np.zeros(n_xx + 1, dtype=np.int64)
     np.cumsum(xx_counts, out=xx_starts[1:])
     return xx_starts, box_order
-
-
-@numba.njit(parallel=True)
-def visit_box_intersections_2d(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
-    first_xx_all: NDArray,
-    first_yy_all: NDArray,
-    xx_starts: NDArray,
-    box_order: NDArray,
-    row_starts: NDArray,
-    cell_offsets: NDArray,
-    flat_members: NDArray,
-    xx_bucket_width: np.int64,
-    yy_bucket_width: np.int64,
-    processor,
-    processor_args=(),
-    progress: ProgressBar | None = None,
-    ellipsoid_radius: float = math.inf,
-) -> None:
-    """Visit every intersecting 2D box pair and call processor(i, j, *processor_args).
-
-    All array arguments must be in sorted order (sorted by first_xx_bucket).
-    Each pair (i, j) with i != j is visited exactly once via canonical-cell
-    deduplication.  i belongs to the prange thread for its first xx-bucket —
-    the processor may safely write to arrays indexed by i without locks.
-
-    processor : @numba.njit callable with signature (i, j, *processor_args).
-    processor_args : tuple of extra arguments forwarded to processor.
-    ellipsoid_radius : if finite, restrict pairs whose normalised 2D
-        centre-to-centre distance exceeds this value.  Default math.inf = full
-        rectangle (no extra filter).
-    """
-    MAX_R2 = ellipsoid_radius * ellipsoid_radius
-    n_xx_buckets = len(row_starts) - 1
-    n_yy_buckets = cell_offsets.shape[1] - 1
-
-    for bx in numba.prange(n_xx_buckets):
-        n_in_bx = xx_starts[bx + 1] - xx_starts[bx]
-        for idx in range(xx_starts[bx], xx_starts[bx + 1]):
-            i = np.int64(box_order[idx])
-            first_xx_bucket = np.int64(bx)
-            last_xx_bucket  = np.int64(math.ceil(xx_hi[i] / xx_bucket_width)) - np.int64(1)
-            first_yy_bucket = first_yy_all[i]
-            last_yy_bucket  = np.int64(math.ceil(yy_hi[i] / yy_bucket_width)) - np.int64(1)
-
-            last_xx_bucket  = min(last_xx_bucket,  np.int64(n_xx_buckets - 1))
-            first_yy_bucket = max(first_yy_bucket, np.int64(0))
-            last_yy_bucket  = min(last_yy_bucket,  np.int64(n_yy_buckets - 1))
-
-            single_cell = (first_xx_bucket == last_xx_bucket and
-                           first_yy_bucket == last_yy_bucket)
-
-            for xx_bucket_idx in range(first_xx_bucket, last_xx_bucket + 1):
-                for yy_bucket_idx in range(first_yy_bucket, last_yy_bucket + 1):
-                    start = row_starts[xx_bucket_idx] + cell_offsets[xx_bucket_idx, yy_bucket_idx]
-                    end   = row_starts[xx_bucket_idx] + cell_offsets[xx_bucket_idx, yy_bucket_idx + 1]
-                    for member_pos in range(start, end):
-                        j = np.int64(flat_members[member_pos])
-                        if j == i:
-                            continue
-                        if not single_cell:
-                            canonical_bx = max(first_xx_bucket, first_xx_all[j])
-                            canonical_by = max(first_yy_bucket, first_yy_all[j])
-                            if xx_bucket_idx != canonical_bx or yy_bucket_idx != canonical_by:
-                                continue
-                        if (xx_lo[i] < xx_hi[j] and xx_lo[j] < xx_hi[i] and
-                                yy_lo[i] < yy_hi[j] and yy_lo[j] < yy_hi[i]):
-                            passes = True
-                            if MAX_R2 < math.inf:
-                                d_xx = (xx_lo[i] + xx_hi[i] - xx_lo[j] - xx_hi[j]) / (xx_hi[i] - xx_lo[i] + xx_hi[j] - xx_lo[j])
-                                d_yy = (yy_lo[i] + yy_hi[i] - yy_lo[j] - yy_hi[j]) / (yy_hi[i] - yy_lo[i] + yy_hi[j] - yy_lo[j])
-                                passes = d_xx * d_xx + d_yy * d_yy <= MAX_R2
-                            if passes:
-                                processor(i, j, *processor_args)
-
-        if progress is not None:
-            progress.update(n_in_bx)
 
 
 @numba.njit(parallel=True)
@@ -684,10 +544,12 @@ def _setup_first_coordinate_left_side_sort(
     xx_hi_idx = np.ceil(xx_hi_f).astype(np.int64).astype(np.uint32)
     yy_lo_idx = np.maximum(np.floor(yy_lo_f), 0).astype(np.int64).astype(np.uint32)
     yy_hi_idx = np.ceil(yy_hi_f).astype(np.int64).astype(np.uint32)
-    row_starts, cell_offsets, flat_members = build_spatial_index_2d(
+    boxes_idx = np.column_stack([
         xx_lo_idx[box_order], xx_hi_idx[box_order],
         yy_lo_idx[box_order], yy_hi_idx[box_order],
-        bw_xx, bw_yy, n_xx, n_yy,
+    ])
+    row_starts, cell_offsets, flat_members = build_spatial_index_2d(
+        boxes_idx, bw_xx, bw_yy, n_xx, n_yy,
     )
 
     box_order_id = np.arange(len(xx_lo_f), dtype=np.int32)
@@ -701,54 +563,8 @@ def _setup_first_coordinate_left_side_sort(
     )
 
 
-def count_intersections_2d(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
-    xx_factor: float = 2.0,
-    yy_factor: float = 2.0,
-    progress=None,
-    ellipsoid_radius: float = math.inf,
-) -> NDArray:
-    """Count per-box 2D intersections using a presorted spatial index.
-
-    xx_lo, xx_hi, yy_lo, yy_hi : half-open [lo, hi) box bounds (any integer dtype).
-    xx_factor, yy_factor : bucket-width multiplier (passed to get_multiplied_median_bucket_widths).
-    ellipsoid_radius : if finite, restrict pairs to those whose normalised centre-to-centre
-        distance is <= ellipsoid_radius.  Pass 1.0 for the inscribed ellipsoid.
-        Default math.inf = full rectangle.
-
-    Returns int32[N] — number of other boxes that overlap each box in (xx, yy).
-
-    Uses the fb-sort strategy: boxes are presorted by first xx-bucket so that
-    the prange over xx-buckets gives sequential i-side access and cache-hot
-    cell_offsets rows.  Each pair (i, j) is counted exactly once via canonical-
-    cell deduplication.
-    """
-    out = _setup_first_coordinate_left_side_sort(
-        np.asarray(xx_lo), np.asarray(xx_hi),
-        np.asarray(yy_lo), np.asarray(yy_hi),
-        xx_factor, yy_factor,
-    )
-    *kernel_args, box_order = out
-    n_boxes = len(box_order)
-    counts_sorted = np.zeros(n_boxes, dtype=np.int32)
-    visit_box_intersections_2d(
-        *kernel_args, _count_processor, (counts_sorted,), progress, ellipsoid_radius,
-    )
-    counts = np.empty_like(counts_sorted)
-    counts[box_order] = counts_sorted
-    return counts
-
-
 def count_intersections_2d_zz(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
-    zz_lo: NDArray,
-    zz_hi: NDArray,
+    boxes: NDArray,
     xx_factor: float = 2.0,
     yy_factor: float = 2.0,
     progress=None,
@@ -756,28 +572,28 @@ def count_intersections_2d_zz(
 ) -> NDArray:
     """Count per-box intersections using a 2D spatial index with a zz-axis filter.
 
-    Same as count_intersections_2d but a pair (i, j) is only counted when the
-    zz intervals also overlap: zz_lo[i] < zz_hi[j] and zz_lo[j] < zz_hi[i].
-
-    xx_lo, xx_hi, yy_lo, yy_hi : half-open [lo, hi) 2D box bounds (any integer dtype).
-    zz_lo, zz_hi               : half-open [lo, hi) bounds along the third axis (int64).
-    xx_factor, yy_factor       : bucket-width multiplier for the 2D index.
-    ellipsoid_radius           : if finite, restrict pairs by 3D normalised centre-to-centre
+    boxes : float or int array of shape (N, 6) with columns
+        [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi].
+        A pair (i, j) is counted only when all three axes overlap.
+    xx_factor, yy_factor : bucket-width multiplier for the 2D index.
+    ellipsoid_radius : if finite, restrict pairs by 3D normalised centre-to-centre
         distance <= ellipsoid_radius.  Default math.inf = full box.
 
     Returns int32[N].
     """
-    xx_lo_raw = np.asarray(xx_lo)
-    xx_hi_raw = np.asarray(xx_hi)
-    yy_lo_raw = np.asarray(yy_lo)
-    yy_hi_raw = np.asarray(yy_hi)
-    out = _setup_first_coordinate_left_side_sort(xx_lo_raw, xx_hi_raw, yy_lo_raw, yy_hi_raw, xx_factor, yy_factor)
+    boxes = np.asarray(boxes)
+    xx_lo = np.ascontiguousarray(boxes[:, 0])
+    xx_hi = np.ascontiguousarray(boxes[:, 1])
+    yy_lo = np.ascontiguousarray(boxes[:, 2])
+    yy_hi = np.ascontiguousarray(boxes[:, 3])
+    zz_lo = np.ascontiguousarray(boxes[:, 4])
+    zz_hi = np.ascontiguousarray(boxes[:, 5])
+    out = _setup_first_coordinate_left_side_sort(xx_lo, xx_hi, yy_lo, yy_hi, xx_factor, yy_factor)
     *kernel_args, box_order = out
 
     zz_lo_s = np.asarray(zz_lo, dtype=np.int64)[box_order]
     zz_hi_s = np.asarray(zz_hi, dtype=np.int64)[box_order]
 
-    # inject zz arrays after yy_hi (4th positional arg)
     xx_s, xxh_s, yy_s, yyh_s, *rest = kernel_args
     n_boxes = len(box_order)
     counts_sorted = np.zeros(n_boxes, dtype=np.int32)
@@ -820,29 +636,19 @@ def _unsort_adj(
 
 
 def find_neighbors_2d_zz(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
-    zz_lo: NDArray,
-    zz_hi: NDArray,
+    boxes: NDArray,
     xx_factor: float = 2.0,
     yy_factor: float = 2.0,
     ellipsoid_radius: float = math.inf,
 ) -> tuple[NDArray, NDArray]:
     """Return CSR adjacency (offsets, neighbors) of intersecting box pairs.
 
-    A pair (i, j) is included when all three axes overlap:
-      xx_lo[i] < xx_hi[j]  and  xx_lo[j] < xx_hi[i]  (half-open)
-      yy_lo[i] < yy_hi[j]  and  yy_lo[j] < yy_hi[i]
-      zz_lo[i] < zz_hi[j]  and  zz_lo[j] < zz_hi[i]
-
-    xx_lo, xx_hi, yy_lo, yy_hi : 2D box bounds — any numeric dtype (int or float).
+    boxes : array of shape (N, 6) with columns [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi].
+        A pair (i, j) is included when all three axes overlap (half-open intervals).
         The spatial index is built from conservatively rounded integer bounds;
         the intersection predicate uses the original values exactly.
-    zz_lo, zz_hi               : third-axis bounds — same treatment.
-    xx_factor, yy_factor       : passed to get_multiplied_median_bucket_widths.
-    ellipsoid_radius           : if finite, restrict pairs by 3D normalised centre-to-centre
+    xx_factor, yy_factor : passed to get_multiplied_median_bucket_widths.
+    ellipsoid_radius : if finite, restrict pairs by 3D normalised centre-to-centre
         distance <= ellipsoid_radius.  Default math.inf = full box.
 
     Returns
@@ -853,12 +659,13 @@ def find_neighbors_2d_zz(
     The adjacency is symmetric: j in neighbors[offsets[i]:offsets[i+1]]
     implies i in neighbors[offsets[j]:offsets[j+1]].
     """
-    xx_lo_f = np.asarray(xx_lo, dtype=np.float64)
-    xx_hi_f = np.asarray(xx_hi, dtype=np.float64)
-    yy_lo_f = np.asarray(yy_lo, dtype=np.float64)
-    yy_hi_f = np.asarray(yy_hi, dtype=np.float64)
-    zz_lo_f = np.asarray(zz_lo, dtype=np.float64)
-    zz_hi_f = np.asarray(zz_hi, dtype=np.float64)
+    boxes = np.asarray(boxes)
+    xx_lo_f = np.ascontiguousarray(boxes[:, 0], dtype=np.float64)
+    xx_hi_f = np.ascontiguousarray(boxes[:, 1], dtype=np.float64)
+    yy_lo_f = np.ascontiguousarray(boxes[:, 2], dtype=np.float64)
+    yy_hi_f = np.ascontiguousarray(boxes[:, 3], dtype=np.float64)
+    zz_lo_f = np.ascontiguousarray(boxes[:, 4], dtype=np.float64)
+    zz_hi_f = np.ascontiguousarray(boxes[:, 5], dtype=np.float64)
 
     N = len(xx_lo_f)
     out = _setup_first_coordinate_left_side_sort(xx_lo_f, xx_hi_f, yy_lo_f, yy_hi_f, xx_factor, yy_factor)
@@ -949,12 +756,7 @@ def _top_k_neighbors_processor(
 
 
 def find_top_k_neighbors_2d_zz(
-    xx_lo: NDArray,
-    xx_hi: NDArray,
-    yy_lo: NDArray,
-    yy_hi: NDArray,
-    zz_lo: NDArray,
-    zz_hi: NDArray,
+    boxes: NDArray,
     intensities: NDArray,
     top_k: int,
     xx_factor: float = 2.0,
@@ -964,10 +766,8 @@ def find_top_k_neighbors_2d_zz(
 ) -> tuple[NDArray, NDArray]:
     """Return the top-k most intense neighbors per box, using a 2D index + zz filter.
 
-    A pair (i, j) is a candidate when all three axes overlap (same predicate as
-    find_neighbors_2d_zz).  Among all candidates for box i, only the top_k with
-    the highest intensity are kept.
-
+    boxes : array of shape (N, 6) with columns [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi].
+        A pair (i, j) is a candidate when all three axes overlap.
     intensities : int64-compatible array of length N — intensity of each box in
         original order.  Zero-intensity boxes are never recorded as neighbors.
 
@@ -982,12 +782,15 @@ def find_top_k_neighbors_2d_zz(
     Result is not sorted within each row; sort by neighbor_ints[i] descending
     if order matters.
     """
-    N = len(np.asarray(xx_lo))
-    out = _setup_first_coordinate_left_side_sort(
-        np.asarray(xx_lo, dtype=np.float64), np.asarray(xx_hi, dtype=np.float64),
-        np.asarray(yy_lo, dtype=np.float64), np.asarray(yy_hi, dtype=np.float64),
-        xx_factor, yy_factor,
-    )
+    boxes = np.asarray(boxes)
+    xx_lo = np.ascontiguousarray(boxes[:, 0], dtype=np.float64)
+    xx_hi = np.ascontiguousarray(boxes[:, 1], dtype=np.float64)
+    yy_lo = np.ascontiguousarray(boxes[:, 2], dtype=np.float64)
+    yy_hi = np.ascontiguousarray(boxes[:, 3], dtype=np.float64)
+    zz_lo = np.ascontiguousarray(boxes[:, 4], dtype=np.float64)
+    zz_hi = np.ascontiguousarray(boxes[:, 5], dtype=np.float64)
+    N = len(xx_lo)
+    out = _setup_first_coordinate_left_side_sort(xx_lo, xx_hi, yy_lo, yy_hi, xx_factor, yy_factor)
     *kernel_args, box_order = out
 
     xx_s, xxh_s, yy_s, yyh_s, fxa_s, fya_s, xx_starts, box_order_id, \
