@@ -3,7 +3,61 @@
 from __future__ import annotations
 
 import numpy as np
+from numba import njit, prange
 from numpy.typing import NDArray
+
+
+@njit(parallel=True)
+def _count_intersections_zz(boxes_a, boxes_b):
+    n_a = boxes_a.shape[0]
+    n_b = boxes_b.shape[0]
+    counts = np.zeros(n_a, dtype=np.int64)
+    for i in prange(n_a):
+        c = np.int64(0)
+        for j in range(n_b):
+            if (boxes_a[i, 0] < boxes_b[j, 1] and boxes_b[j, 0] < boxes_a[i, 1] and
+                    boxes_a[i, 2] < boxes_b[j, 3] and boxes_b[j, 2] < boxes_a[i, 3] and
+                    boxes_a[i, 4] < boxes_b[j, 5] and boxes_b[j, 4] < boxes_a[i, 5]):
+                c += 1
+        counts[i] = c
+    return counts
+
+
+@njit(parallel=True)
+def _fill_intersections_zz(boxes_a, boxes_b, offsets, out):
+    n_a = boxes_a.shape[0]
+    n_b = boxes_b.shape[0]
+    for i in prange(n_a):
+        k = offsets[i]
+        for j in range(n_b):
+            if (boxes_a[i, 0] < boxes_b[j, 1] and boxes_b[j, 0] < boxes_a[i, 1] and
+                    boxes_a[i, 2] < boxes_b[j, 3] and boxes_b[j, 2] < boxes_a[i, 3] and
+                    boxes_a[i, 4] < boxes_b[j, 5] and boxes_b[j, 4] < boxes_a[i, 5]):
+                out[k, 0] = i
+                out[k, 1] = j
+                k += 1
+
+
+def brute_force_intersections_zz(
+    boxes_a: NDArray,
+    boxes_b: NDArray,
+) -> NDArray:
+    """Return all (i, j) pairs where box i in boxes_a overlaps box j in boxes_b.
+
+    boxes_a, boxes_b : (N, 6) arrays with columns [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi].
+    Overlap is strict (open intervals): a_lo < b_hi and b_lo < a_hi on every axis.
+
+    Returns shape (M, 2) int64 array of (i, j) pairs, parallelised over rows of boxes_a.
+    """
+    boxes_a = np.ascontiguousarray(boxes_a, dtype=np.int64)
+    boxes_b = np.ascontiguousarray(boxes_b, dtype=np.int64)
+    counts = _count_intersections_zz(boxes_a, boxes_b)
+    offsets = np.empty(len(counts) + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(counts, out=offsets[1:])
+    out = np.empty((int(offsets[-1]), 2), dtype=np.int64)
+    _fill_intersections_zz(boxes_a, boxes_b, offsets[:-1], out)
+    return out
 
 
 def brute_force_top_k_neighbors_2d_zz(
