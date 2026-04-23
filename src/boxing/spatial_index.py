@@ -433,7 +433,9 @@ def visit_box_intersections_2d_zz(
 
     boxes : float64[N, 6] sorted by first xx-bucket, columns [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi].
     A pair is visited only when all three axes overlap (half-open intervals).
-    ellipsoid_radius : if finite, applies a 3D normalised distance filter.
+    ellipsoid_radius : if finite, applies a normalised distance filter in
+        the indexed xx/yy plane.  The zz axis is still required to overlap,
+        but it is not part of the ellipsoid distance.
     """
     MAX_R2 = ellipsoid_radius * ellipsoid_radius
     n_xx_buckets = len(row_starts) - 1
@@ -482,8 +484,7 @@ def visit_box_intersections_2d_zz(
                             if MAX_R2 < math.inf:
                                 d_xx = (xb + xe - xbj - xej) / (xe - xb + xej - xbj)
                                 d_yy = (yb + ye - ybj - yej) / (ye - yb + yej - ybj)
-                                d_zz = (zb + ze - zbj - zej) / (ze - zb + zej - zbj)
-                                passes = d_xx * d_xx + d_yy * d_yy + d_zz * d_zz <= MAX_R2
+                                passes = d_xx * d_xx + d_yy * d_yy <= MAX_R2
                             if passes:
                                 processor(i, j, *processor_args)
 
@@ -563,8 +564,9 @@ def count_intersections_2d_zz(
         [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi].
         A pair (i, j) is counted only when all three axes overlap.
     xx_factor, yy_factor : bucket-width multiplier for the 2D index.
-    ellipsoid_radius : if finite, restrict pairs by 3D normalised centre-to-centre
-        distance <= ellipsoid_radius.  Default math.inf = full box.
+    ellipsoid_radius : if finite, restrict pairs by normalised centre-to-centre
+        distance in the xx/yy plane.  The zz axis must still overlap, but is
+        not part of the distance.  Default math.inf = full box.
 
     Returns int32[N].
     """
@@ -627,8 +629,9 @@ def find_neighbors_2d_zz(
         The spatial index is built from conservatively rounded integer bounds;
         the intersection predicate uses the original values exactly.
     xx_factor, yy_factor : passed to get_multiplied_median_bucket_widths.
-    ellipsoid_radius : if finite, restrict pairs by 3D normalised centre-to-centre
-        distance <= ellipsoid_radius.  Default math.inf = full box.
+    ellipsoid_radius : if finite, restrict pairs by normalised centre-to-centre
+        distance in the xx/yy plane.  The zz axis must still overlap, but is
+        not part of the distance.  Default math.inf = full box.
 
     Returns
     -------
@@ -726,6 +729,49 @@ def _top_k_neighbors_processor(
         neighbor_ints[orig_i, min_slot] = new_intensity
 
 
+@numba.njit
+def _top_k_neighbors_shell_processor(
+    i: np.int64,
+    j: np.int64,
+    neighbor_ids: NDArray,
+    neighbor_ints: NDArray,
+    intensities: NDArray,
+    sort_perm: NDArray,
+    prec_idxs_s: NDArray,
+    boxes_s: NDArray,
+    inner_boxes_s: NDArray,
+) -> None:
+    """Like _top_k_neighbors_processor but skips j when j intersects inner box of i.
+
+    boxes_s      : float64[N, 6] sorted outer boxes (same space as i, j indices).
+    inner_boxes_s: float64[N, 6] sorted inner boxes, aligned to boxes_s via box_order.
+    j is rejected (not added to top-k) when its outer box overlaps inner_boxes_s[i]
+    on all three axes — i.e. j lies inside the inner shell of i.
+    """
+    if (inner_boxes_s[i, 0] < boxes_s[j, 1] and boxes_s[j, 0] < inner_boxes_s[i, 1] and
+            inner_boxes_s[i, 2] < boxes_s[j, 3] and boxes_s[j, 2] < inner_boxes_s[i, 3] and
+            inner_boxes_s[i, 4] < boxes_s[j, 5] and boxes_s[j, 4] < inner_boxes_s[i, 5]):
+        return
+    orig_i = np.int64(sort_perm[i])
+    new_intensity = intensities[j]
+    if new_intensity == np.int64(0):
+        return
+    new_id = np.int32(prec_idxs_s[j])
+    top_k = neighbor_ids.shape[1]
+
+    min_intensity = neighbor_ints[orig_i, 0]
+    min_slot = np.int64(0)
+    for slot in range(1, top_k):
+        v = neighbor_ints[orig_i, slot]
+        if v < min_intensity:
+            min_intensity = v
+            min_slot = np.int64(slot)
+
+    if new_intensity > min_intensity:
+        neighbor_ids[orig_i, min_slot] = new_id
+        neighbor_ints[orig_i, min_slot] = new_intensity
+
+
 def find_top_k_neighbors_2d_zz(
     boxes: NDArray,
     intensities: NDArray,
@@ -735,6 +781,7 @@ def find_top_k_neighbors_2d_zz(
     progress=None,
     ellipsoid_radius: float = math.inf,
     precursor_idxs: NDArray | None = None,
+    inner_boxes: NDArray | None = None,
 ) -> tuple[NDArray, NDArray]:
     """Return the top-k most intense neighbors per box, using a 2D index + zz filter.
 
@@ -742,6 +789,9 @@ def find_top_k_neighbors_2d_zz(
         A pair (i, j) is a candidate when all three axes overlap.
     intensities : int64-compatible array of length N — intensity of each box in
         original order.  Zero-intensity boxes are never recorded as neighbors.
+    ellipsoid_radius : if finite, restrict pairs by normalised centre-to-centre
+        distance in the xx/yy plane.  The zz axis must still overlap, but is
+        not part of the distance.  Default math.inf = full box.
     precursor_idxs : int32-compatible array of length N or None.
         Maps box index → precursor index.  When provided, neighbor_ids entries
         contain precursor indices rather than box indices.  When None, defaults
@@ -778,12 +828,21 @@ def find_top_k_neighbors_2d_zz(
     neighbor_ids  = np.full((N, top_k), -1, dtype=np.int32)
     neighbor_ints = np.zeros((N, top_k), dtype=np.int64)
 
+    if inner_boxes is None:
+        proc = _top_k_neighbors_processor
+        proc_args = (neighbor_ids, neighbor_ints, intensities_s, box_order, precursor_idxs_s)
+    else:
+        inner_boxes_s = np.asarray(inner_boxes, dtype=np.float64)[box_order]
+        proc = _top_k_neighbors_shell_processor
+        proc_args = (
+            neighbor_ids, neighbor_ints, intensities_s, box_order, precursor_idxs_s,
+            boxes_s, inner_boxes_s,
+        )
+
     visit_box_intersections_2d_zz(
         boxes_s, fxa_s, fya_s, xx_starts, box_order_id,
         row_starts, cell_offsets, flat_members, bw_xx, bw_yy,
-        _top_k_neighbors_processor,
-        (neighbor_ids, neighbor_ints, intensities_s, box_order, precursor_idxs_s),
-        progress, ellipsoid_radius,
+        proc, proc_args, progress, ellipsoid_radius,
     )
 
     return neighbor_ids, neighbor_ints, prec_to_row

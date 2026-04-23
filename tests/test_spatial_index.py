@@ -206,6 +206,25 @@ def test_top_k_tof_filter_removes_pairs():
     assert _top_k_as_dict(ids, ints, 1) == {}
 
 
+def test_top_k_ellipsoid_ignores_zz_distance():
+    """Ellipsoid mode filters xx/yy center distance only; zz remains overlap-only."""
+    boxes = np.array([
+        [0, 10, 0, 10, 0, 100],
+        [2, 12, 2, 12, 99, 199],
+    ], dtype=np.int64)
+    intensities = np.array([100, 200], dtype=np.int64)
+
+    ids, ints, _ = find_top_k_neighbors_2d_zz(
+        boxes,
+        intensities,
+        top_k=1,
+        ellipsoid_radius=1.0,
+    )
+
+    assert _top_k_as_dict(ids, ints, 0) == {1: 200}
+    assert _top_k_as_dict(ids, ints, 1) == {0: 100}
+
+
 @pytest.mark.skipif(not _REAL_DATA.exists(), reason="dev data not available")
 def test_self_intersection_count_on_real_data():
     """Build index on 4M boxes and verify a positive self-intersection count."""
@@ -307,6 +326,32 @@ def test_dense_to_csr_no_neighbors():
     offsets, flat_ids = dense_neighbors_to_csr(ids)
     assert list(offsets) == [0, 0, 0]
     assert len(flat_ids) == 0
+
+
+def test_dense_to_csr_no_neighbors_mmappet(tmp_path):
+    """Zero-neighbor CSR output writes readable empty mmappet neighbors."""
+    ids = np.full((2, 3), -1, dtype=np.int32)
+    ints = np.zeros((2, 3), dtype=np.int64)
+
+    offsets, flat_ids, flat_ints = dense_neighbors_to_csr(
+        ids, ints, out_path=tmp_path / "csr"
+    )
+
+    assert list(offsets) == [0, 0, 0]
+    assert len(flat_ids) == 0
+    assert len(flat_ints) == 0
+
+    import mmappet
+
+    neighbors = mmappet.open_dataset_dct(tmp_path / "csr" / "neighbors.mmappet")
+    assert list(neighbors) == ["prec_idx", "intensity"]
+    assert neighbors["prec_idx"].dtype == np.dtype(np.int32)
+    assert neighbors["intensity"].dtype == np.dtype(np.int64)
+    assert len(neighbors["prec_idx"]) == 0
+    assert len(neighbors["intensity"]) == 0
+
+    index = mmappet.open_dataset_dct(tmp_path / "csr" / "index.mmappet")
+    np.testing.assert_array_equal(index["offset"], np.array([0, 0, 0], dtype=np.int64))
 
 
 def test_top_k_validate_with_precursor_idxs(zz_boxes):

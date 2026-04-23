@@ -66,12 +66,15 @@ def brute_force_top_k_neighbors_2d_zz(
     intensities: NDArray,
     top_k: int,
     precursor_idxs: NDArray | None = None,
+    inner_boxes: NDArray | None = None,
 ) -> list[int]:
     """Return exact top-k neighbour indices for box i by exhaustive search.
 
     boxes : (N, 6) array with columns [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi].
     A neighbour j is any box (j != i) whose intervals overlap on all three axes.
-    Among all neighbours, return the indices of the top_k with highest intensity.
+    inner_boxes : when provided, candidates that also intersect inner_boxes[i] are
+        excluded (shell filter).  Same shape as boxes.
+    Among all shell neighbours, return the indices of the top_k with highest intensity.
     When there are fewer than top_k neighbours, return all of them.
     Tie-breaking at the boundary is arbitrary (argpartition order).
     precursor_idxs : when provided, returned ids are precursor indices rather
@@ -88,6 +91,15 @@ def brute_force_top_k_neighbors_2d_zz(
         (yy_lo < yy_hi[i]) & (yy_lo[i] < yy_hi) &
         (zz_lo < zz_hi[i]) & (zz_lo[i] < zz_hi)
     )
+    if inner_boxes is not None:
+        inner_boxes = np.asarray(inner_boxes)
+        inn = inner_boxes[i]
+        inner_mask = (
+            (xx_lo < inn[1]) & (inn[0] < xx_hi) &
+            (yy_lo < inn[3]) & (inn[2] < yy_hi) &
+            (zz_lo < inn[5]) & (inn[4] < zz_hi)
+        )
+        mask &= ~inner_mask
     mask[i] = False
     positions = np.where(mask)[0]
     if len(positions) <= top_k:
@@ -112,10 +124,13 @@ def validate_top_k_neighbors_2d_zz(
     K: int = 100,
     seed: int = 42,
     precursor_idxs: NDArray | None = None,
+    inner_boxes: NDArray | None = None,
 ) -> list[tuple]:
     """Validate neighbor_ids / neighbor_ints against brute-force results.
 
     boxes : (N, 6) array with columns [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi].
+    inner_boxes : when provided, applies the shell filter (same shape as boxes).
+        Candidates intersecting inner_boxes[i] are not genuine neighbours of i.
 
     Parameters
     ----------
@@ -144,6 +159,9 @@ def validate_top_k_neighbors_2d_zz(
     yy_lo, yy_hi = boxes[:, 2], boxes[:, 3]
     zz_lo, zz_hi = boxes[:, 4], boxes[:, 5]
 
+    if inner_boxes is not None:
+        inner_boxes = np.asarray(inner_boxes)
+
     if precursor_idxs is not None:
         precursor_idxs = np.asarray(precursor_idxs)
 
@@ -161,8 +179,16 @@ def validate_top_k_neighbors_2d_zz(
             (yy_lo < yy_hi[i]) & (yy_lo[i] < yy_hi) &
             (zz_lo < zz_hi[i]) & (zz_lo[i] < zz_hi)
         )
+        if inner_boxes is not None:
+            inn = inner_boxes[i]
+            inner_mask = (
+                (xx_lo < inn[1]) & (inn[0] < xx_hi) &
+                (yy_lo < inn[3]) & (inn[2] < yy_hi) &
+                (zz_lo < inn[5]) & (inn[4] < zz_hi)
+            )
+            mask &= ~inner_mask
         mask[i] = False
-        all_positions = np.where(mask)[0]  # box indices of genuine neighbours
+        all_positions = np.where(mask)[0]  # box indices of genuine shell neighbours
 
         if precursor_idxs is not None:
             all_ids = set(precursor_idxs[all_positions].tolist())
