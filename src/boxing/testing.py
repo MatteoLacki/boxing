@@ -6,6 +6,8 @@ import numpy as np
 from numba import njit, prange
 from numpy.typing import NDArray
 
+from boxing.spatial_index import _make_centered_boxes
+
 
 @njit(parallel=True)
 def _count_intersections_zz(boxes_a, boxes_b):
@@ -62,25 +64,29 @@ def brute_force_intersections_zz(
 
 def brute_force_top_k_neighbors_2d_zz(
     i: int,
-    boxes: NDArray,
+    centers: NDArray,
+    scales: NDArray,
+    mz_radius_da: float,
     intensities: NDArray,
     top_k: int,
+    xy_mults: tuple[float, float] = (1.0, 1.0),
+    geometry: str = "box",
+    cylinder_radius: float = 1.0,
     precursor_idxs: NDArray | None = None,
-    inner_boxes: NDArray | None = None,
+    inner_xy_mults: tuple[float, float] | None = None,
+    inner_mz_radius_da: float | None = None,
 ) -> list[int]:
     """Return exact top-k neighbour indices for box i by exhaustive search.
 
-    boxes : (N, 6) array with columns [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi].
-    A neighbour j is any box (j != i) whose intervals overlap on all three axes.
-    inner_boxes : when provided, candidates that also intersect inner_boxes[i] are
-        excluded (shell filter).  Same shape as boxes.
+    centers/scales plus mz radii describe centered supports, matching
+    find_top_k_neighbors_2d_zz.
     Among all shell neighbours, return the indices of the top_k with highest intensity.
     When there are fewer than top_k neighbours, return all of them.
     Tie-breaking at the boundary is arbitrary (argpartition order).
     precursor_idxs : when provided, returned ids are precursor indices rather
         than box indices.
     """
-    boxes = np.asarray(boxes)
+    boxes = _make_centered_boxes(centers, scales, xy_mults, mz_radius_da)
     intensities = np.asarray(intensities)
     xx_lo, xx_hi = boxes[:, 0], boxes[:, 1]
     yy_lo, yy_hi = boxes[:, 2], boxes[:, 3]
@@ -91,14 +97,38 @@ def brute_force_top_k_neighbors_2d_zz(
         (yy_lo < yy_hi[i]) & (yy_lo[i] < yy_hi) &
         (zz_lo < zz_hi[i]) & (zz_lo[i] < zz_hi)
     )
-    if inner_boxes is not None:
-        inner_boxes = np.asarray(inner_boxes)
+    if geometry == "cylinder":
+        d_xx = (xx_lo[i] + xx_hi[i] - xx_lo - xx_hi) / (
+            xx_hi[i] - xx_lo[i] + xx_hi - xx_lo
+        )
+        d_yy = (yy_lo[i] + yy_hi[i] - yy_lo - yy_hi) / (
+            yy_hi[i] - yy_lo[i] + yy_hi - yy_lo
+        )
+        mask &= d_xx * d_xx + d_yy * d_yy <= cylinder_radius * cylinder_radius
+    elif geometry != "box":
+        raise ValueError(f"geometry must be 'box' or 'cylinder', got {geometry!r}")
+
+    if inner_xy_mults is not None and (
+        float(inner_xy_mults[0]) > 0 or float(inner_xy_mults[1]) > 0
+    ):
+        if inner_mz_radius_da is None:
+            inner_mz_radius_da = mz_radius_da
+        inner_boxes = _make_centered_boxes(
+            centers,
+            scales,
+            inner_xy_mults,
+            inner_mz_radius_da,
+        )
         inn = inner_boxes[i]
         inner_mask = (
             (xx_lo < inn[1]) & (inn[0] < xx_hi) &
             (yy_lo < inn[3]) & (inn[2] < yy_hi) &
             (zz_lo < inn[5]) & (inn[4] < zz_hi)
         )
+        if geometry == "cylinder":
+            d_xx = (inn[0] + inn[1] - xx_lo - xx_hi) / (inn[1] - inn[0] + xx_hi - xx_lo)
+            d_yy = (inn[2] + inn[3] - yy_lo - yy_hi) / (inn[3] - inn[2] + yy_hi - yy_lo)
+            inner_mask &= d_xx * d_xx + d_yy * d_yy <= cylinder_radius * cylinder_radius
         mask &= ~inner_mask
     mask[i] = False
     positions = np.where(mask)[0]
@@ -114,23 +144,28 @@ def brute_force_top_k_neighbors_2d_zz(
 
 
 def validate_top_k_neighbors_2d_zz(
-    boxes: NDArray,
+    centers: NDArray,
+    scales: NDArray,
+    mz_radius_da: float,
     intensities: NDArray,
     neighbor_ids: NDArray,
     neighbor_ints: NDArray,
     top_k: int,
     *,
+    xy_mults: tuple[float, float] = (1.0, 1.0),
+    geometry: str = "box",
+    cylinder_radius: float = 1.0,
     indices: NDArray | None = None,
     K: int = 100,
     seed: int = 42,
     precursor_idxs: NDArray | None = None,
-    inner_boxes: NDArray | None = None,
+    inner_xy_mults: tuple[float, float] | None = None,
+    inner_mz_radius_da: float | None = None,
 ) -> list[tuple]:
     """Validate neighbor_ids / neighbor_ints against brute-force results.
 
-    boxes : (N, 6) array with columns [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi].
-    inner_boxes : when provided, applies the shell filter (same shape as boxes).
-        Candidates intersecting inner_boxes[i] are not genuine neighbours of i.
+    centers/scales plus mz radii describe centered supports, matching
+    find_top_k_neighbors_2d_zz.
 
     Parameters
     ----------
@@ -153,14 +188,27 @@ def validate_top_k_neighbors_2d_zz(
     - No excluded neighbour strictly more intense than the weakest kept.
       (Ties at the boundary are allowed to break either way.)
     """
-    boxes = np.asarray(boxes)
+    boxes = _make_centered_boxes(centers, scales, xy_mults, mz_radius_da)
     intensities = np.asarray(intensities)
     xx_lo, xx_hi = boxes[:, 0], boxes[:, 1]
     yy_lo, yy_hi = boxes[:, 2], boxes[:, 3]
     zz_lo, zz_hi = boxes[:, 4], boxes[:, 5]
 
-    if inner_boxes is not None:
-        inner_boxes = np.asarray(inner_boxes)
+    if geometry not in {"box", "cylinder"}:
+        raise ValueError(f"geometry must be 'box' or 'cylinder', got {geometry!r}")
+
+    inner_boxes = None
+    if inner_xy_mults is not None and (
+        float(inner_xy_mults[0]) > 0 or float(inner_xy_mults[1]) > 0
+    ):
+        if inner_mz_radius_da is None:
+            inner_mz_radius_da = mz_radius_da
+        inner_boxes = _make_centered_boxes(
+            centers,
+            scales,
+            inner_xy_mults,
+            inner_mz_radius_da,
+        )
 
     if precursor_idxs is not None:
         precursor_idxs = np.asarray(precursor_idxs)
@@ -179,6 +227,14 @@ def validate_top_k_neighbors_2d_zz(
             (yy_lo < yy_hi[i]) & (yy_lo[i] < yy_hi) &
             (zz_lo < zz_hi[i]) & (zz_lo[i] < zz_hi)
         )
+        if geometry == "cylinder":
+            d_xx = (xx_lo[i] + xx_hi[i] - xx_lo - xx_hi) / (
+                xx_hi[i] - xx_lo[i] + xx_hi - xx_lo
+            )
+            d_yy = (yy_lo[i] + yy_hi[i] - yy_lo - yy_hi) / (
+                yy_hi[i] - yy_lo[i] + yy_hi - yy_lo
+            )
+            mask &= d_xx * d_xx + d_yy * d_yy <= cylinder_radius * cylinder_radius
         if inner_boxes is not None:
             inn = inner_boxes[i]
             inner_mask = (
@@ -186,6 +242,14 @@ def validate_top_k_neighbors_2d_zz(
                 (yy_lo < inn[3]) & (inn[2] < yy_hi) &
                 (zz_lo < inn[5]) & (inn[4] < zz_hi)
             )
+            if geometry == "cylinder":
+                d_xx = (inn[0] + inn[1] - xx_lo - xx_hi) / (
+                    inn[1] - inn[0] + xx_hi - xx_lo
+                )
+                d_yy = (inn[2] + inn[3] - yy_lo - yy_hi) / (
+                    inn[3] - inn[2] + yy_hi - yy_lo
+                )
+                inner_mask &= d_xx * d_xx + d_yy * d_yy <= cylinder_radius * cylinder_radius
             mask &= ~inner_mask
         mask[i] = False
         all_positions = np.where(mask)[0]  # box indices of genuine shell neighbours

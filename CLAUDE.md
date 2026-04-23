@@ -17,7 +17,7 @@ tests/
 └── test_connected_components.py
 
 configs/precursor_neighbors/
-└── default.toml            # frame_mult, scan_mult, frame_inner_mult, scan_inner_mult
+└── default.toml            # neighbor geometry and radii/multiplier defaults
 ```
 
 Entry point registered in `pyproject.toml`:
@@ -29,12 +29,14 @@ precursor-neighbors = boxing.cli.precursor_neighbors:main
 
 ## Core: `spatial_index.py`
 
-### Box format
-All functions use `(N, 6)` float64/int arrays with columns:
-```
-[xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi]
-```
-Overlap is strict open-interval: `a_lo < b_hi AND b_lo < a_hi` on every axis.
+### Centered geometry format
+The public top-k API accepts:
+- `centers`: `(N, 3)` columns `[xx, yy, mz]`
+- `scales`: `(N, 2)` columns `[xx_scale, yy_scale]`
+- `xy_mults`: first-two-dimension support multipliers
+- `mz_radius_da`: scalar outer m/z half-width
+
+Internally, the implementation derives endpoint boxes for bucket lookup. Overlap is strict open-interval on the internal bounds.
 
 ### Spatial index structure
 ```
@@ -51,35 +53,27 @@ Bucket assignment is half-open: last bucket = `(hi - 1) // width`, clamped to `[
 
 ### Key functions
 
-#### `build_spatial_index_2d(boxes_2d, bw_xx, bw_yy, n_xx, n_yy) → (row_starts, cell_offsets, flat_members)`
-Two-pass CSR build (count → prefix-sum → fill). Takes 4-column 2D boxes.
+#### `find_top_k_neighbors_2d_zz(centers, scales, mz_radius_da, intensities, top_k, ..., xy_mults=(1,1), geometry="box", cylinder_radius=1.0, precursor_idxs=None, inner_xy_mults=None, inner_mz_radius_da=None)`
+Top-level Python function (not JIT). Builds centered supports, sorts boxes, builds the internal index, runs visitor, and returns dense top-k neighbors.
 
-#### `visit_box_intersections_2d_zz(boxes, ..., processor, processor_args, progress, ellipsoid_radius)`
-`@numba.njit(parallel=True)`. Visits every intersecting (i, j) pair and calls `processor(i, j, *processor_args)`. Canonical-cell deduplication ensures each pair is visited once per direction. Optional `ellipsoid_radius` adds a 3D normalised centre-distance filter.
-
-#### `find_top_k_neighbors_2d_zz(boxes, intensities, top_k, ..., precursor_idxs=None, inner_boxes=None) → (neighbor_ids, neighbor_ints, prec_to_row)`
-Top-level Python function (not JIT). Sorts boxes, builds index, runs visitor.
-
-- `neighbor_ids`: int32[N, top_k] — neighbor precursor (or box) ids; -1 = empty slot
+- `neighbor_ids`: int32[N, top_k] — neighbor precursor ids when `precursor_idxs` is provided; -1 = empty slot
 - `neighbor_ints`: int64[N, top_k] — corresponding intensities; 0 = empty slot
-- `prec_to_row`: int32 mapping precursor_idx → row in result arrays (-1 if absent)
+- `prec_to_row`: int32 mapping precursor_idx → row in result arrays when precursor ids are provided
 - Zero-intensity neighbors are never recorded (sentinel).
-- `inner_boxes`: when provided, activates shell filter (see below).
+- `geometry="box"` uses axis-aligned overlap in all dimensions.
+- `geometry="cylinder"` requires z overlap and applies `cylinder_radius` to the normalized first-two-dimension center distance.
 
-#### Shell filter (`inner_boxes`)
-When `inner_boxes` is not None, uses `_top_k_neighbors_shell_processor` instead of `_top_k_neighbors_processor`. Candidate j is rejected if j's outer box intersects `inner_boxes[i]` on all three axes. When `inner_boxes` is None, original code path runs with zero overhead.
+#### Shell filter
+When `inner_xy_mults` is provided and either multiplier is positive, candidates are rejected if their outer support intersects the query precursor's inner support. `inner_mz_radius_da` defaults to the outer `mz_radius_da`.
 
 #### `dense_neighbors_to_csr(neighbor_ids, neighbor_ints=None, prec_to_row=None, out_path=None)`
 Converts dense (N, K) arrays to CSR. When `prec_to_row` provided, offsets are indexed by precursor index. When `out_path` provided, writes mmappet datasets (`neighbors.mmappet`, `index.mmappet`).
-
-#### `find_neighbors_2d_zz(boxes, ...) → (offsets, neighbors)`
-Returns full symmetric neighbor graph as CSR (no top-k, no intensities).
 
 ---
 
 ## CLI: `precursor_neighbors.py`
 
-Reads precursor parquet, builds 6D boxes (frame/scan + tof from DIA window), runs `find_top_k_neighbors_2d_zz`, writes CSR mmappet output.
+Reads precursor parquet, reads DIA isolation width from OpenTIMS, passes frame/scan/mz centers plus frame/scan scales and m/z radii to `find_top_k_neighbors_2d_zz`, then writes CSR mmappet output.
 
 ### `PrecursorNeighborsConfig` (Pydantic)
 
@@ -89,13 +83,13 @@ Reads precursor parquet, builds 6D boxes (frame/scan + tof from DIA window), run
 | `scan_mult` | 1.0 | gt=0 | outer box half-width in scan units × scan_scale |
 | `frame_inner_mult` | 0.0 | ge=0 | inner box half-width; 0 = no shell filter |
 | `scan_inner_mult` | 0.0 | ge=0 | inner box half-width; 0 = no shell filter |
-| `mz_inner_radius_da` | None | ge=0 | if set, inner tof bounds = mz2tof(mz ± mz_inner_radius_da) instead of isolation window |
+| `mz_inner_radius_da` | None | ge=0 | if set, inner m/z bounds use mz ± mz_inner_radius_da; otherwise use outer m/z radius |
+| `top_k` | 64 | gt=0 | maximum neighbors per precursor |
+| `geometry` | "box" | "box" or "cylinder" | first-two-dimension support geometry |
+| `cylinder_radius` | 1.0 | gt=0 | normalized 2D cylinder radius when `geometry="cylinder"` |
 
 Config loaded from `--config TOML` (optional). Falls back to model defaults when omitted.
 Config validated by `check_configs` pipeline rule via `scripts/check_configs.py`.
-
-### Box SQL
-`_BOXES_SQL` formats `{frame_mult}`, `{scan_mult}`, `{tof_lo_col}`, `{tof_hi_col}`. Outer boxes always use `tof_lo`/`tof_hi` (isolation window). Inner boxes use `tof_lo`/`tof_hi` by default; when `mz_inner_radius_da` is set, `_add_inner_tof_bounds` adds `tof_lo_inner`/`tof_hi_inner` columns and the inner SQL uses those instead.
 
 ### Output
 Directory with two mmappet datasets:
@@ -109,10 +103,10 @@ Directory with two mmappet datasets:
 ### `brute_force_intersections_zz(boxes_a, boxes_b) → NDArray[int64, (M, 2)]`
 Numba parallel two-pass. Returns all (i, j) pairs where box i in A overlaps box j in B.
 
-### `brute_force_top_k_neighbors_2d_zz(i, boxes, intensities, top_k, precursor_idxs=None, inner_boxes=None) → list[int]`
-Exhaustive O(N) search for box i. Supports shell filter via `inner_boxes`.
+### `brute_force_top_k_neighbors_2d_zz(...) → list[int]`
+Exhaustive O(N) search for centered top-k geometry.
 
-### `validate_top_k_neighbors_2d_zz(boxes, intensities, neighbor_ids, neighbor_ints, top_k, *, inner_boxes=None, ...) → list[tuple]`
+### `validate_top_k_neighbors_2d_zz(...) → list[tuple]`
 Checks a random sample of boxes against brute force. Returns `(box_idx, reason)` for mismatches. Supports shell filter. Validity criteria:
 - No spurious ids
 - Correct count: `min(top_k, genuine_neighbors)`
@@ -135,4 +129,4 @@ Run with `pytest` from the boxing root.
 - `test_spatial_index.py` — unit tests for index build, top-k correctness, CSR conversion, precursor_idxs remapping. Includes a `validate_top_k_neighbors_2d_zz` round-trip test. One test is skipped unless `temp/dev_intersection_boxes.parquet` exists.
 - `test_connected_components.py` — connected component tests.
 
-Key test fixture `zz_boxes`: 4 boxes with known tof-filtered neighbor graph; all tests are hand-verifiable.
+Key test fixture `zz_boxes`: 4 boxes with known m/z-filtered neighbor graph; all tests are hand-verifiable.
