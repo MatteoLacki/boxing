@@ -211,7 +211,7 @@ def main() -> None:
         type=Path,
         default=None,
         metavar="TOML",
-        help="Config TOML with urt_mult/frame_mult/scan_mult (default: all 1.0).",
+        help="Config TOML with frame/scan multipliers and geometry options.",
     )
     args = parser.parse_args()
     compute_precursor_neighbors(

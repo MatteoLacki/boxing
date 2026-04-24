@@ -152,6 +152,26 @@ def test_top_k_cylinder_ignores_zz_distance():
     assert _top_k_as_dict(ids, ints, 1) == {0: 100}
 
 
+def test_top_k_uses_integer_xy_semantics():
+    """x/y overlap is evaluated on conservative integer half-open supports."""
+    centers = np.array([
+        [0.5, 0.5, 50.0],
+        [1.0, 1.0, 50.0],
+    ], dtype=np.float64)
+    scales = np.array([
+        [0.4, 0.4],
+        [0.05, 0.05],
+    ], dtype=np.float64)
+    intensities = np.array([100, 200], dtype=np.int64)
+
+    ids, ints, _ = find_top_k_neighbors_2d_zz(
+        centers, scales, mz_radius_da=10.0, intensities=intensities, top_k=1
+    )
+
+    assert _top_k_as_dict(ids, ints, 0) == {1: 200}
+    assert _top_k_as_dict(ids, ints, 1) == {0: 100}
+
+
 def test_top_k_validated_against_brute_force(zz_boxes):
     """find_top_k_neighbors_2d_zz result matches brute-force on all 4 boxes."""
     centers, scales, mz_radius_da, intensities = zz_boxes

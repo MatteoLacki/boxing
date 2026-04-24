@@ -28,8 +28,6 @@ Design notes
 """
 from __future__ import annotations
 
-import math
-
 import numpy as np
 import numba
 from numpy.typing import NDArray
@@ -90,12 +88,14 @@ def _count_cell_memberships_numba(
     Bucket IDs are clamped to [0, n_*_buckets - 1].
     """
     for i in range(len(boxes)):
-        xb = np.int64(boxes[i, 0]); xe = np.int64(boxes[i, 1])
-        yb = np.int64(boxes[i, 2]); ye = np.int64(boxes[i, 3])
+        xb = np.int64(boxes[i, 0])
+        xe = np.int64(boxes[i, 1])
+        yb = np.int64(boxes[i, 2])
+        ye = np.int64(boxes[i, 3])
         first_xx_bucket = xb // xx_bucket_width
-        last_xx_bucket  = (xe - np.int64(1)) // xx_bucket_width
+        last_xx_bucket = (xe - np.int64(1)) // xx_bucket_width
         first_yy_bucket = yb // yy_bucket_width
-        last_yy_bucket  = (ye - np.int64(1)) // yy_bucket_width
+        last_yy_bucket = (ye - np.int64(1)) // yy_bucket_width
 
         if first_xx_bucket < np.int64(0):
             first_xx_bucket = np.int64(0)
@@ -109,6 +109,7 @@ def _count_cell_memberships_numba(
         for xx_bucket_idx in range(first_xx_bucket, last_xx_bucket + 1):
             for yy_bucket_idx in range(first_yy_bucket, last_yy_bucket + 1):
                 counts_2d[xx_bucket_idx, yy_bucket_idx] += 1
+
 
 # ---------------------------------------------------------------------------
 # Index construction (pure NumPy — not in hot path)
@@ -164,12 +165,14 @@ def _fill_memberships_numba(
     cursors[bx, by] is post-incremented after each write.
     """
     for i in range(len(boxes)):
-        xb = np.int64(boxes[i, 0]); xe = np.int64(boxes[i, 1])
-        yb = np.int64(boxes[i, 2]); ye = np.int64(boxes[i, 3])
+        xb = np.int64(boxes[i, 0])
+        xe = np.int64(boxes[i, 1])
+        yb = np.int64(boxes[i, 2])
+        ye = np.int64(boxes[i, 3])
         first_xx_bucket = xb // xx_bucket_width
-        last_xx_bucket  = (xe - np.int64(1)) // xx_bucket_width
+        last_xx_bucket = (xe - np.int64(1)) // xx_bucket_width
         first_yy_bucket = yb // yy_bucket_width
-        last_yy_bucket  = (ye - np.int64(1)) // yy_bucket_width
+        last_yy_bucket = (ye - np.int64(1)) // yy_bucket_width
 
         if first_xx_bucket < np.int64(0):
             first_xx_bucket = np.int64(0)
@@ -182,9 +185,11 @@ def _fill_memberships_numba(
 
         for xx_bucket_idx in range(first_xx_bucket, last_xx_bucket + 1):
             for yy_bucket_idx in range(first_yy_bucket, last_yy_bucket + 1):
-                pos = (row_starts[xx_bucket_idx]
-                       + cell_offsets[xx_bucket_idx, yy_bucket_idx]
-                       + cursors[xx_bucket_idx, yy_bucket_idx])
+                pos = (
+                    row_starts[xx_bucket_idx]
+                    + cell_offsets[xx_bucket_idx, yy_bucket_idx]
+                    + cursors[xx_bucket_idx, yy_bucket_idx]
+                )
                 flat_members[pos] = np.int32(i)
                 cursors[xx_bucket_idx, yy_bucket_idx] += 1
 
@@ -247,8 +252,10 @@ def build_spatial_index_2d(
     counts = np.zeros((n_xx_buckets, n_yy_buckets), dtype=np.int64)
     _count_cell_memberships_numba(
         boxes,
-        np.int64(xx_bucket_width), np.int64(yy_bucket_width),
-        np.int64(n_xx_buckets), np.int64(n_yy_buckets),
+        np.int64(xx_bucket_width),
+        np.int64(yy_bucket_width),
+        np.int64(n_xx_buckets),
+        np.int64(n_yy_buckets),
         counts,
     )
 
@@ -259,9 +266,14 @@ def build_spatial_index_2d(
     cursors = np.zeros((n_xx_buckets, n_yy_buckets), dtype=np.int64)
     _fill_memberships_numba(
         boxes,
-        np.int64(xx_bucket_width), np.int64(yy_bucket_width),
-        np.int64(n_xx_buckets), np.int64(n_yy_buckets),
-        row_starts, cell_offsets, cursors, flat_members,
+        np.int64(xx_bucket_width),
+        np.int64(yy_bucket_width),
+        np.int64(n_xx_buckets),
+        np.int64(n_yy_buckets),
+        row_starts,
+        cell_offsets,
+        cursors,
+        flat_members,
     )
 
     return row_starts, cell_offsets, flat_members
@@ -290,13 +302,55 @@ def _build_xx_index(
     return xx_starts, box_order
 
 
-@numba.njit(parallel=True)
-def visit_box_intersections_2d_zz(
+def _make_centered_xy_boxes_i64(
     centers: NDArray,
     scales: NDArray,
-    xx_mult: float,
-    yy_mult: float,
+    xy_mults: tuple[float, float],
+) -> NDArray:
+    """Return conservative integer half-open x/y supports as int64."""
+    centers = np.asarray(centers, dtype=np.float64)
+    scales = np.asarray(scales, dtype=np.float64)
+    if centers.ndim != 2 or centers.shape[1] != 3:
+        raise ValueError(f"centers must have shape (N, 3), got {centers.shape}")
+    if scales.shape != (len(centers), 2):
+        raise ValueError(f"scales must have shape (N, 2), got {scales.shape}")
+    if len(xy_mults) != 2:
+        raise ValueError("xy_mults must contain exactly two values")
+
+    rx = float(xy_mults[0]) * scales[:, 0]
+    ry = float(xy_mults[1]) * scales[:, 1]
+    if (rx < 0).any() or (ry < 0).any():
+        raise ValueError("xy_mults * scales must be >= 0")
+
+    x_lo = np.floor(centers[:, 0] - rx).clip(0).astype(np.int64)
+    x_hi = np.ceil(centers[:, 0] + rx).astype(np.int64)
+    y_lo = np.floor(centers[:, 1] - ry).clip(0).astype(np.int64)
+    y_hi = np.ceil(centers[:, 1] + ry).astype(np.int64)
+    return np.column_stack([x_lo, x_hi, y_lo, y_hi])
+
+
+def _make_centered_zz_bounds(
+    centers: NDArray,
     mz_radius_da: float,
+) -> NDArray:
+    """Return float64 half-open z supports."""
+    centers = np.asarray(centers, dtype=np.float64)
+    if centers.ndim != 2 or centers.shape[1] != 3:
+        raise ValueError(f"centers must have shape (N, 3), got {centers.shape}")
+    if mz_radius_da < 0:
+        raise ValueError("mz_radius_da must be >= 0")
+    return np.column_stack(
+        [
+            centers[:, 2] - float(mz_radius_da),
+            centers[:, 2] + float(mz_radius_da),
+        ]
+    )
+
+
+@numba.njit(parallel=True)
+def visit_box_intersections_2d_zz(
+    boxes: NDArray,
+    zz_bounds: NDArray,
     first_xx_all: NDArray,
     first_yy_all: NDArray,
     xx_starts: NDArray,
@@ -314,8 +368,8 @@ def visit_box_intersections_2d_zz(
 ) -> None:
     """Visit every intersecting centered support pair and call processor(i, j, *processor_args).
 
-    centers/scales are sorted by first xx-bucket. Supports are defined by
-    xx_mult, yy_mult and mz_radius_da inside this query loop.
+    boxes is int64[N, 6] with columns [x_lo, x_hi, y_lo, y_hi, intensity, precursor_idx].
+    zz_bounds is float64[N, 2] with columns [z_lo, z_hi], aligned to xy_rows.
     use_cylinder : when true, applies a normalised 2D cylinder cross-section
         filter in the indexed xx/yy plane.  The zz axis is still required to
         overlap, but it is not part of the cylinder distance.
@@ -328,28 +382,36 @@ def visit_box_intersections_2d_zz(
         n_in_bx = xx_starts[bx + 1] - xx_starts[bx]
         for idx in range(xx_starts[bx], xx_starts[bx + 1]):
             i = np.int64(box_order[idx])
-            rx = xx_mult * scales[i, 0]
-            ry = yy_mult * scales[i, 1]
-            xb = centers[i, 0] - rx; xe = centers[i, 0] + rx
-            yb = centers[i, 1] - ry; ye = centers[i, 1] + ry
-            zb = centers[i, 2] - mz_radius_da; ze = centers[i, 2] + mz_radius_da
+            xb = boxes[i, 0]
+            xe = boxes[i, 1]
+            yb = boxes[i, 2]
+            ye = boxes[i, 3]
+            zb = zz_bounds[i, 0]
+            ze = zz_bounds[i, 1]
 
             first_xx_bucket = np.int64(bx)
-            last_xx_bucket  = np.int64(math.ceil(xe / xx_bucket_width)) - np.int64(1)
+            last_xx_bucket = (xe - np.int64(1)) // xx_bucket_width
             first_yy_bucket = first_yy_all[i]
-            last_yy_bucket  = np.int64(math.ceil(ye / yy_bucket_width)) - np.int64(1)
+            last_yy_bucket = (ye - np.int64(1)) // yy_bucket_width
 
-            last_xx_bucket  = min(last_xx_bucket,  np.int64(n_xx_buckets - 1))
+            last_xx_bucket = min(last_xx_bucket, np.int64(n_xx_buckets - 1))
             first_yy_bucket = max(first_yy_bucket, np.int64(0))
-            last_yy_bucket  = min(last_yy_bucket,  np.int64(n_yy_buckets - 1))
+            last_yy_bucket = min(last_yy_bucket, np.int64(n_yy_buckets - 1))
 
-            single_cell = (first_xx_bucket == last_xx_bucket and
-                           first_yy_bucket == last_yy_bucket)
+            single_cell = (
+                first_xx_bucket == last_xx_bucket and first_yy_bucket == last_yy_bucket
+            )
 
             for xx_bucket_idx in range(first_xx_bucket, last_xx_bucket + 1):
                 for yy_bucket_idx in range(first_yy_bucket, last_yy_bucket + 1):
-                    start = row_starts[xx_bucket_idx] + cell_offsets[xx_bucket_idx, yy_bucket_idx]
-                    end   = row_starts[xx_bucket_idx] + cell_offsets[xx_bucket_idx, yy_bucket_idx + 1]
+                    start = (
+                        row_starts[xx_bucket_idx]
+                        + cell_offsets[xx_bucket_idx, yy_bucket_idx]
+                    )
+                    end = (
+                        row_starts[xx_bucket_idx]
+                        + cell_offsets[xx_bucket_idx, yy_bucket_idx + 1]
+                    )
                     for member_pos in range(start, end):
                         j = np.int64(flat_members[member_pos])
                         if j == i:
@@ -357,16 +419,25 @@ def visit_box_intersections_2d_zz(
                         if not single_cell:
                             canonical_bx = max(first_xx_bucket, first_xx_all[j])
                             canonical_by = max(first_yy_bucket, first_yy_all[j])
-                            if xx_bucket_idx != canonical_bx or yy_bucket_idx != canonical_by:
+                            if (
+                                xx_bucket_idx != canonical_bx
+                                or yy_bucket_idx != canonical_by
+                            ):
                                 continue
-                        rxj = xx_mult * scales[j, 0]
-                        ryj = yy_mult * scales[j, 1]
-                        xbj = centers[j, 0] - rxj; xej = centers[j, 0] + rxj
-                        ybj = centers[j, 1] - ryj; yej = centers[j, 1] + ryj
-                        zbj = centers[j, 2] - mz_radius_da; zej = centers[j, 2] + mz_radius_da
-                        if (xb < xej and xbj < xe and
-                                yb < yej and ybj < ye and
-                                zb < zej and zbj < ze):
+                        xbj = boxes[j, 0]
+                        xej = boxes[j, 1]
+                        ybj = boxes[j, 2]
+                        yej = boxes[j, 3]
+                        zbj = zz_bounds[j, 0]
+                        zej = zz_bounds[j, 1]
+                        if (
+                            xb < xej
+                            and xbj < xe
+                            and yb < yej
+                            and ybj < ye
+                            and zb < zej
+                            and zbj < ze
+                        ):
                             passes = True
                             if use_cylinder:
                                 d_xx = (xb + xe - xbj - xej) / (xe - xb + xej - xbj)
@@ -380,62 +451,70 @@ def visit_box_intersections_2d_zz(
 
 
 def _setup_first_coordinate_left_side_sort(
-    boxes: NDArray,
     centers: NDArray,
     scales: NDArray,
+    intensities: NDArray,
+    precursor_idxs: NDArray,
+    xy_mults: tuple[float, float],
+    mz_radius_da: float,
     xx_factor: float,
     yy_factor: float,
 ):
-    """Build the presorted spatial index; return all arrays needed by the kernels.
+    """Build the presorted x/y spatial index and aligned sorted payload arrays."""
+    xy_boxes = _make_centered_xy_boxes_i64(centers, scales, xy_mults)
+    zz_bounds = _make_centered_zz_bounds(centers, mz_radius_da)
+    intensities = np.asarray(intensities, dtype=np.int64)
+    precursor_idxs = np.asarray(precursor_idxs, dtype=np.int64)
 
-    boxes : (N, 6) array [xx_lo, xx_hi, yy_lo, yy_hi, zz_lo, zz_hi], any dtype.
-    The spatial index is built from conservatively rounded integer bounds (floor lo,
-    ceil hi) so every bucket touched by a float box is included.  The returned
-    centers/scales are C-contiguous copies sorted by first xx-bucket.
-    """
-    boxes_f = np.asarray(boxes, dtype=np.float64)
-    xx_lo_f = boxes_f[:, 0]
-    xx_hi_f = boxes_f[:, 1]
-    yy_lo_f = boxes_f[:, 2]
-    yy_hi_f = boxes_f[:, 3]
+    xx_lo = xy_boxes[:, 0]
+    xx_hi = xy_boxes[:, 1]
+    yy_lo = xy_boxes[:, 2]
+    yy_hi = xy_boxes[:, 3]
 
-    xx_widths = xx_hi_f - xx_lo_f
-    yy_widths = yy_hi_f - yy_lo_f
-    bw_xx, bw_yy = get_multiplied_median_bucket_widths(xx_widths, yy_widths, xx_factor, yy_factor)
-    n_xx = int(xx_hi_f.max()) // bw_xx + 1
-    n_yy = int(yy_hi_f.max()) // bw_yy + 1
+    xx_widths = xx_hi - xx_lo
+    yy_widths = yy_hi - yy_lo
+    bw_xx, bw_yy = get_multiplied_median_bucket_widths(
+        xx_widths, yy_widths, xx_factor, yy_factor
+    )
+    n_xx = int(xx_hi.max()) // bw_xx + 1
+    n_yy = int(yy_hi.max()) // bw_yy + 1
 
-    # first_xx/yy_all: floor division; clamp to 0 so negative lo boxes start at bucket 0.
-    first_xx_all = np.maximum(np.floor(xx_lo_f / bw_xx), 0).astype(np.int64)
-    first_yy_all = np.maximum(np.floor(yy_lo_f / bw_yy), 0).astype(np.int64)
+    first_xx_all = (xx_lo // bw_xx).astype(np.int64)
+    first_yy_all = (yy_lo // bw_yy).astype(np.int64)
 
     xx_starts, box_order = _build_xx_index(first_xx_all, n_xx)
 
-    centers_s = np.ascontiguousarray(np.asarray(centers, dtype=np.float64)[box_order])
-    scales_s = np.ascontiguousarray(np.asarray(scales, dtype=np.float64)[box_order])
-    fxa_s = first_xx_all[box_order]
-    fya_s = first_yy_all[box_order]
+    boxes = np.empty((len(xy_boxes), 6), dtype=np.int64)
+    boxes[:, :4] = xy_boxes
+    boxes[:, 4] = intensities
+    boxes[:, 5] = precursor_idxs
+    boxes_s = np.ascontiguousarray(boxes[box_order])
+    zz_bounds_s = np.ascontiguousarray(zz_bounds[box_order])
+    fxa_s = np.ascontiguousarray(first_xx_all[box_order])
+    fya_s = np.ascontiguousarray(first_yy_all[box_order])
 
-    # Build the spatial index from conservatively rounded integer bounds.
-    xx_lo_idx = np.floor(xx_lo_f).clip(0).astype(np.int32)
-    xx_hi_idx = np.ceil(xx_hi_f).astype(np.int32)
-    yy_lo_idx = np.floor(yy_lo_f).clip(0).astype(np.int32)
-    yy_hi_idx = np.ceil(yy_hi_f).astype(np.int32)
-    boxes_idx = np.column_stack([
-        xx_lo_idx[box_order], xx_hi_idx[box_order],
-        yy_lo_idx[box_order], yy_hi_idx[box_order],
-    ])
+    boxes_idx = np.ascontiguousarray(boxes_s[:, :4].astype(np.int32))
     row_starts, cell_offsets, flat_members = build_spatial_index_2d(
-        boxes_idx, bw_xx, bw_yy, n_xx, n_yy,
+        boxes_idx,
+        bw_xx,
+        bw_yy,
+        n_xx,
+        n_yy,
     )
 
-    box_order_id = np.arange(len(boxes_f), dtype=np.int32)
+    box_order_id = np.arange(len(boxes), dtype=np.int32)
     return (
-        centers_s, scales_s,
-        fxa_s, fya_s,
-        xx_starts, box_order_id,
-        row_starts, cell_offsets, flat_members,
-        np.int64(bw_xx), np.int64(bw_yy),
+        boxes_s,
+        zz_bounds_s,
+        fxa_s,
+        fya_s,
+        xx_starts,
+        box_order_id,
+        row_starts,
+        cell_offsets,
+        flat_members,
+        np.int64(bw_xx),
+        np.int64(bw_yy),
         box_order,
     )
 
@@ -474,14 +553,16 @@ def _make_centered_boxes(
         raise ValueError("xy_mults * scales must be >= 0")
     if mz_radius_da < 0:
         raise ValueError("mz_radius_da must be >= 0")
-    return np.column_stack([
-        centers[:, 0] - rx,
-        centers[:, 0] + rx,
-        centers[:, 1] - ry,
-        centers[:, 1] + ry,
-        centers[:, 2] - float(mz_radius_da),
-        centers[:, 2] + float(mz_radius_da),
-    ])
+    return np.column_stack(
+        [
+            centers[:, 0] - rx,
+            centers[:, 0] + rx,
+            centers[:, 1] - ry,
+            centers[:, 1] + ry,
+            centers[:, 2] - float(mz_radius_da),
+            centers[:, 2] + float(mz_radius_da),
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -495,28 +576,23 @@ def _top_k_neighbors_processor(
     j: np.int64,
     neighbor_ids: NDArray,
     neighbor_ints: NDArray,
-    intensities: NDArray,
+    boxes: NDArray,
     sort_perm: NDArray,
-    prec_idxs_s: NDArray,
 ) -> None:
     """Insert neighbor j into the top-k table for box i (min-intensity eviction).
 
     neighbor_ids, neighbor_ints : int32/int64 [N, top_k] indexed by original box i.
-    intensities  : int64[N] in sorted order.
+    boxes        : int64[N, 6] in sorted order.
     sort_perm    : box_order (sorted → original box index) — used to address rows
                    in neighbor_ids/neighbor_ints.
-    prec_idxs_s  : int32[N] sorted by box_order; maps sorted j → precursor index.
-                   When no precursor remapping is needed, pass box_order itself so
-                   prec_idxs_s[j] == original box index.
-
     Zero is the empty-slot sentinel in neighbor_ints — neighbors with intensity
     zero are never inserted.  Safe for ion-count data where zero means no signal.
     """
     orig_i = np.int64(sort_perm[i])
-    new_intensity = intensities[j]
+    new_intensity = boxes[j, 4]
     if new_intensity == np.int64(0):
         return
-    new_id = np.int32(prec_idxs_s[j])
+    new_id = np.int32(boxes[j, 5])
     top_k = neighbor_ids.shape[1]
 
     min_intensity = neighbor_ints[orig_i, 0]
@@ -538,17 +614,11 @@ def _top_k_neighbors_shell_processor(
     j: np.int64,
     neighbor_ids: NDArray,
     neighbor_ints: NDArray,
-    intensities: NDArray,
+    boxes: NDArray,
     sort_perm: NDArray,
-    prec_idxs_s: NDArray,
-    centers_s: NDArray,
-    scales_s: NDArray,
-    outer_xx_mult: float,
-    outer_yy_mult: float,
-    outer_mz_radius_da: float,
-    inner_xx_mult: float,
-    inner_yy_mult: float,
-    inner_mz_radius_da: float,
+    outer_zz_bounds: NDArray,
+    inner_boxes: NDArray,
+    inner_zz_bounds: NDArray,
     use_cylinder: bool,
     cylinder_radius: float,
 ) -> None:
@@ -556,21 +626,21 @@ def _top_k_neighbors_shell_processor(
 
     j is rejected when its outer support intersects i's inner support.
     """
-    irx = inner_xx_mult * scales_s[i, 0]
-    iry = inner_yy_mult * scales_s[i, 1]
-    ixb = centers_s[i, 0] - irx; ixe = centers_s[i, 0] + irx
-    iyb = centers_s[i, 1] - iry; iye = centers_s[i, 1] + iry
-    izb = centers_s[i, 2] - inner_mz_radius_da; ize = centers_s[i, 2] + inner_mz_radius_da
+    ixb = inner_boxes[i, 0]
+    ixe = inner_boxes[i, 1]
+    iyb = inner_boxes[i, 2]
+    iye = inner_boxes[i, 3]
+    izb = inner_zz_bounds[i, 0]
+    ize = inner_zz_bounds[i, 1]
 
-    jrx = outer_xx_mult * scales_s[j, 0]
-    jry = outer_yy_mult * scales_s[j, 1]
-    jxb = centers_s[j, 0] - jrx; jxe = centers_s[j, 0] + jrx
-    jyb = centers_s[j, 1] - jry; jye = centers_s[j, 1] + jry
-    jzb = centers_s[j, 2] - outer_mz_radius_da; jze = centers_s[j, 2] + outer_mz_radius_da
+    jxb = boxes[j, 0]
+    jxe = boxes[j, 1]
+    jyb = boxes[j, 2]
+    jye = boxes[j, 3]
+    jzb = outer_zz_bounds[j, 0]
+    jze = outer_zz_bounds[j, 1]
 
-    if (ixb < jxe and jxb < ixe and
-            iyb < jye and jyb < iye and
-            izb < jze and jzb < ize):
+    if ixb < jxe and jxb < ixe and iyb < jye and jyb < iye and izb < jze and jzb < ize:
         reject = True
         if use_cylinder:
             d_xx = (ixb + ixe - jxb - jxe) / (ixe - ixb + jxe - jxb)
@@ -579,10 +649,10 @@ def _top_k_neighbors_shell_processor(
         if reject:
             return
     orig_i = np.int64(sort_perm[i])
-    new_intensity = intensities[j]
+    new_intensity = boxes[j, 4]
     if new_intensity == np.int64(0):
         return
-    new_id = np.int32(prec_idxs_s[j])
+    new_id = np.int32(boxes[j, 5])
     top_k = neighbor_ids.shape[1]
 
     min_intensity = neighbor_ints[orig_i, 0]
@@ -613,59 +683,45 @@ def find_top_k_neighbors_2d_zz(
     precursor_idxs: NDArray | None = None,
     inner_xy_mults: tuple[float, float] | None = None,
     inner_mz_radius_da: float | None = None,
-) -> tuple[NDArray, NDArray]:
-    """Return the top-k most intense neighbors per centered support.
-
-    centers : float array of shape (N, 3), columns [xx, yy, mz].
-    scales : float array of shape (N, 2), columns [xx_scale, yy_scale].
-    mz_radius_da : scalar outer m/z half-width for the third dimension.
-    intensities : int64-compatible array of length N — intensity of each box in
-        original order.  Zero-intensity boxes are never recorded as neighbors.
-    xy_mults : first-two-dimension half-width multipliers.
-    geometry : "box" for axis-aligned overlap or "cylinder" for normalised
-        2D cylinder cross-section plus z overlap.
-    cylinder_radius : normalized first-two-dimension cylinder radius.
-    precursor_idxs : int32-compatible array of length N or None.
-        Maps box index → precursor index.  When provided, neighbor_ids entries
-        contain precursor indices rather than box indices.  When None, defaults
-        to np.arange(N) so neighbor_ids contains box indices (original behavior).
-    inner_xy_mults : optional first-two-dimension multipliers for the excluded
-        inner support.  A nonzero pair enables shell filtering.
-    inner_mz_radius_da : optional inner m/z half-width.  Defaults to
-        mz_radius_da when inner_xy_mults enables shell filtering.
-
-    Returns
-    -------
-    neighbor_ids  : int32[N, top_k]  — precursor (or box) ids of the top-k
-        neighbors; unused slots contain -1.
-    neighbor_ints : int64[N, top_k]  — corresponding intensities; unused slots
-        contain 0.
-
-    Both arrays are in original box order (row i = box i as passed in).
-    Result is not sorted within each row; sort by neighbor_ints[i] descending
-    if order matters.
-    """
+) -> tuple[NDArray, NDArray, NDArray | None]:
     use_cylinder = _geometry_to_use_cylinder(geometry)
-    xx_mult = float(xy_mults[0])
-    yy_mult = float(xy_mults[1])
-    boxes = _make_centered_boxes(centers, scales, xy_mults, mz_radius_da)
-    N = len(boxes)
-    out = _setup_first_coordinate_left_side_sort(boxes, centers, scales, xx_factor, yy_factor)
-    centers_s, scales_s, fxa_s, fya_s, xx_starts, box_order_id, \
-        row_starts, cell_offsets, flat_members, bw_xx, bw_yy, box_order = out
-
-    intensities_s = np.asarray(intensities, dtype=np.int64)[box_order]
+    centers = np.asarray(centers, dtype=np.float64)
+    N = len(centers)
 
     if precursor_idxs is None:
-        precursor_idxs = np.arange(N, dtype=np.int32)
+        precursor_idxs = np.arange(N, dtype=np.uint32)
         prec_to_row = None
     else:
-        precursor_idxs = np.asarray(precursor_idxs, dtype=np.int32)
+        precursor_idxs = np.asarray(precursor_idxs, dtype=np.int64)
         prec_to_row = np.full(int(precursor_idxs.max()) + 1, -1, dtype=np.int32)
         prec_to_row[precursor_idxs] = np.arange(N, dtype=np.int32)
-    precursor_idxs_s = precursor_idxs[box_order]
 
-    neighbor_ids  = np.full((N, top_k), -1, dtype=np.int32)
+    out = _setup_first_coordinate_left_side_sort(
+        centers,
+        scales,
+        intensities,
+        precursor_idxs,
+        xy_mults,
+        mz_radius_da,
+        xx_factor,
+        yy_factor,
+    )
+    (
+        boxes_s,
+        zz_bounds_s,
+        fxa_s,
+        fya_s,
+        xx_starts,
+        box_order_id,
+        row_starts,
+        cell_offsets,
+        flat_members,
+        bw_xx,
+        bw_yy,
+        box_order,
+    ) = out
+
+    neighbor_ids = np.full((N, top_k), -1, dtype=np.int32)
     neighbor_ints = np.zeros((N, top_k), dtype=np.int64)
 
     use_inner_filter = False
@@ -678,22 +734,47 @@ def find_top_k_neighbors_2d_zz(
 
     if not use_inner_filter:
         proc = _top_k_neighbors_processor
-        proc_args = (neighbor_ids, neighbor_ints, intensities_s, box_order, precursor_idxs_s)
+        proc_args = (neighbor_ids, neighbor_ints, boxes_s, box_order)
     else:
+        inner_xy_boxes = _make_centered_xy_boxes_i64(centers, scales, inner_xy_mults)[
+            box_order
+        ]
+        inner_boxes = np.empty((N, 6), dtype=np.int64)
+        inner_boxes[:, :4] = inner_xy_boxes
+        inner_boxes[:, 4:] = 0
+        inner_zz_bounds = _make_centered_zz_bounds(centers, inner_mz_radius_da)[
+            box_order
+        ]
         proc = _top_k_neighbors_shell_processor
         proc_args = (
-            neighbor_ids, neighbor_ints, intensities_s, box_order, precursor_idxs_s,
-            centers_s, scales_s,
-            xx_mult, yy_mult, mz_radius_da,
-            float(inner_xy_mults[0]), float(inner_xy_mults[1]), inner_mz_radius_da,
-            use_cylinder, cylinder_radius,
+            neighbor_ids,
+            neighbor_ints,
+            boxes_s,
+            box_order,
+            zz_bounds_s,
+            inner_boxes,
+            inner_zz_bounds,
+            use_cylinder,
+            cylinder_radius,
         )
 
     visit_box_intersections_2d_zz(
-        centers_s, scales_s, xx_mult, yy_mult, mz_radius_da,
-        fxa_s, fya_s, xx_starts, box_order_id,
-        row_starts, cell_offsets, flat_members, bw_xx, bw_yy,
-        proc, proc_args, progress, use_cylinder, cylinder_radius,
+        boxes_s,
+        zz_bounds_s,
+        fxa_s,
+        fya_s,
+        xx_starts,
+        box_order_id,
+        row_starts,
+        cell_offsets,
+        flat_members,
+        bw_xx,
+        bw_yy,
+        proc,
+        proc_args,
+        progress,
+        use_cylinder,
+        cylinder_radius,
     )
 
     return neighbor_ids, neighbor_ints, prec_to_row
@@ -730,9 +811,9 @@ def dense_neighbors_to_csr(
     """
     # ---- compute source rows and offsets ----------------------------------------
     if prec_to_row is not None:
-        present = np.where(prec_to_row >= 0)[0]   # prec_idx values, ascending
+        present = np.where(prec_to_row >= 0)[0]  # prec_idx values, ascending
         rows = prec_to_row[present]
-        src_ids  = neighbor_ids[rows]              # (P, K) in prec_idx order
+        src_ids = neighbor_ids[rows]  # (P, K) in prec_idx order
         src_ints = neighbor_ints[rows] if neighbor_ints is not None else None
         valid = src_ids >= 0
         counts = valid.sum(axis=1).astype(np.int64)
@@ -740,7 +821,7 @@ def dense_neighbors_to_csr(
         offsets[present + 1] = counts
         np.cumsum(offsets, out=offsets)
     else:
-        src_ids  = neighbor_ids
+        src_ids = neighbor_ids
         src_ints = neighbor_ints
         valid = neighbor_ids >= 0
         counts = valid.sum(axis=1).astype(np.int64)
@@ -753,6 +834,7 @@ def dense_neighbors_to_csr(
     if out_path is not None:
         import mmappet
         from pathlib import Path as _Path
+
         out_path = _Path(out_path)
         if out_path.exists():
             raise ValueError(f"out_path already exists: {out_path}")
@@ -761,10 +843,13 @@ def dense_neighbors_to_csr(
         neighbors_scheme = mmappet.get_schema(prec_idx=neighbor_ids.dtype)
         if neighbor_ints is not None:
             neighbors_scheme = mmappet.get_schema(
-                prec_idx=neighbor_ids.dtype, intensity=neighbor_ints.dtype,
+                prec_idx=neighbor_ids.dtype,
+                intensity=neighbor_ints.dtype,
             )
         neighbors_ds = mmappet.open_new_dataset_dct(
-            out_path / "neighbors.mmappet", scheme=neighbors_scheme, nrows=M,
+            out_path / "neighbors.mmappet",
+            scheme=neighbors_scheme,
+            nrows=M,
         )
         flat_ids = neighbors_ds["prec_idx"]
         flat_ints = neighbors_ds["intensity"] if neighbor_ints is not None else None
@@ -777,7 +862,11 @@ def dense_neighbors_to_csr(
         index_ds["offset"][:] = offsets
     else:
         flat_ids = np.empty(M, dtype=neighbor_ids.dtype)
-        flat_ints = np.empty(M, dtype=neighbor_ints.dtype) if neighbor_ints is not None else None
+        flat_ints = (
+            np.empty(M, dtype=neighbor_ints.dtype)
+            if neighbor_ints is not None
+            else None
+        )
 
     # ---- fill flat arrays -------------------------------------------------------
     flat_ids[:] = src_ids[valid]
