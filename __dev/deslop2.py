@@ -121,34 +121,14 @@ def hi_cell_idx(center, radius, inverse_width, highest_cell_idx):
     return min(int((center + radius) * inverse_width) + 1, highest_cell_idx)
 
 
-@numba.njit(boundscheck=True)
-def count_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, out,):
-    """Increment out[i,j] for every grid cell each box overlaps. First pass of CSR build."""
+def _stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, cells, processor, processor_args):
+    """Iterate all boxes and their overlapping cells, calling processor(n, i, j, imin, jmin, *processor_args).
+    Single-threaded: safe for processors with shared mutable state (build phase)."""
     inv_xw = 1 / xwidth
     inv_yw = 1 / ywidth
-    xhi = out.shape[0]
-    yhi = out.shape[1]
-    for idx in range(len(xcenters)):
-        xc = xcenters[idx]; yc = ycenters[idx]
-        xs = xscales[idx];  ys = yscales[idx]
-        imin = lo_cell_idx(xc, xmult*xs, inv_xw)
-        jmin = lo_cell_idx(yc, ymult*ys, inv_yw)
-        itop = hi_cell_idx(xc, xmult*xs, inv_xw, xhi)
-        jtop = hi_cell_idx(yc, ymult*ys, inv_yw, yhi)
-        for i in range(imin, itop):
-            for j in range(jmin, jtop):
-                out[i,j] += 1
-
-
-@numba.njit(boundscheck=True)
-def fill_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, idx, flat):
-    """Write array index into flat for every cell it overlaps. Second pass of CSR build."""
-    inv_xw = 1 / xwidth
-    inv_yw = 1 / ywidth
-    xhi = idx.shape[0]
-    yhi = idx.shape[1] - 1
-    cursors = np.zeros_like(idx)
-    for n in range(len(xcenters)):
+    xhi = cells.shape[0]
+    yhi = cells.shape[1] - 1
+    for n in numba.prange(len(xcenters)):
         xc = xcenters[n]; yc = ycenters[n]
         xs = xscales[n];  ys = yscales[n]
         imin = lo_cell_idx(xc, xmult*xs, inv_xw)
@@ -157,80 +137,111 @@ def fill_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth,
         jtop = hi_cell_idx(yc, ymult*ys, inv_yw, yhi)
         for i in range(imin, itop):
             for j in range(jmin, jtop):
-                pos = idx[i, j] + cursors[i, j]
-                flat[pos] = n
-                cursors[i, j] += 1
+                processor(n, i, j, imin, jmin, *processor_args)
+
+stream_cells = numba.njit(_stream_cells)
+stream_cells_parallel = numba.njit(parallel=True)(_stream_cells)
 
 
 @numba.njit
-def _visit_intersections(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth,
-                         cells, nb_box_idxs,
-                         idx_xcenters, idx_ycenters, idx_xscales, idx_yscales,
-                         processor, processor_args):
-    """For each query box n, call processor(n, k, *processor_args) for every indexed box k it intersects.
-    Each pair is visited exactly once via the canonical-cell rule: max(lo_n, lo_k) per axis.
-    First buckets of indexed boxes are computed on the fly from idx_x/ycenters and idx_x/yscales."""
+def _count_proc(n, i, j, imin, jmin, out):
+    out[i, j] += 1
+
+
+@numba.njit
+def _fill_proc(n, i, j, imin, jmin, idx, flat, cursors):
+    pos = idx[i, j] + cursors[i, j]
+    flat[pos] = n
+    cursors[i, j] += 1
+
+
+@numba.njit
+def _visit_proc(n, i, j, imin, jmin, cells, nb_box_idxs,
+                idx_xcenters, idx_ycenters, idx_xscales, idx_yscales,
+                xmult, ymult, xwidth, ywidth, processor, processor_args):
+    """Canonical-cell dedup then call inner processor(n, k, *processor_args) for each true neighbor k."""
     inv_xw = 1 / xwidth
     inv_yw = 1 / ywidth
-    xhi = cells.shape[0]
-    yhi = cells.shape[1] - 1
-    for stored_box_idx in range(len(xcenters)):
-        xc = xcenters[stored_box_idx]; yc = ycenters[stored_box_idx]
-        xs = xscales[stored_box_idx];  ys = yscales[stored_box_idx]
-        imin = lo_cell_idx(xc, xmult*xs, inv_xw)
-        jmin = lo_cell_idx(yc, ymult*ys, inv_yw)
-        itop = hi_cell_idx(xc, xmult*xs, inv_xw, xhi)
-        jtop = hi_cell_idx(yc, ymult*ys, inv_yw, yhi)
-        for i in range(imin, itop):
-            for j in range(jmin, jtop):
-                for pos in range(cells[i, j], cells[i, j + 1]):
-                    nb_box_idx = nb_box_idxs[pos]
-                    # on fly finding of stored boxes top-left cell idxs
-                    nb_lowest_x = lo_cell_idx(idx_xcenters[nb_box_idx], xmult*idx_xscales[nb_box_idx], inv_xw)
-                    nb_lowest_y = lo_cell_idx(idx_ycenters[nb_box_idx], ymult*idx_yscales[nb_box_idx], inv_yw)
-                    if i != max(imin, nb_lowest_x) or j != max(jmin, nb_lowest_y):
-                        continue
-                    processor(stored_box_idx, nb_box_idx, *processor_args)
+    for pos in range(cells[i, j], cells[i, j + 1]):
+        k = nb_box_idxs[pos]
+        nb_lowest_x = lo_cell_idx(idx_xcenters[k], xmult*idx_xscales[k], inv_xw)
+        nb_lowest_y = lo_cell_idx(idx_ycenters[k], ymult*idx_yscales[k], inv_yw)
+        if i != max(imin, nb_lowest_x) or j != max(jmin, nb_lowest_y):
+            continue
+        processor(n, k, *processor_args)
+
+
+@numba.njit
+def count_2d_intersections(n, k, counts, xcenters, ycenters, xscales, yscales, xmult, ymult):
+    """Increment counts[n] if boxes n and k truly overlap in 2D. Race-free: writes only to counts[n]."""
+    xlo_n = xcenters[n] - xmult * xscales[n]; xhi_n = xcenters[n] + xmult * xscales[n]
+    ylo_n = ycenters[n] - ymult * yscales[n]; yhi_n = ycenters[n] + ymult * yscales[n]
+    xlo_k = xcenters[k] - xmult * xscales[k]; xhi_k = xcenters[k] + xmult * xscales[k]
+    ylo_k = ycenters[k] - ymult * yscales[k]; yhi_k = ycenters[k] + ymult * yscales[k]
+    if xlo_n < xhi_k and xlo_k < xhi_n and ylo_n < yhi_k and ylo_k < yhi_n:
+        counts[n] += 1
+
+
+@numba.njit(boundscheck=True)
+def count_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, out):
+    """Increment out[i,j] for every grid cell each box overlaps. First pass of CSR build."""
+    stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, out, _count_proc, (out,))
+
+
+@numba.njit(boundscheck=True)
+def fill_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, idx, flat):
+    """Write array index into flat for every cell it overlaps. Second pass of CSR build."""
+    cursors = np.zeros_like(idx)
+    stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, idx, _fill_proc, (idx, flat, cursors))
 
 
 @dataclass
-class GridIndex:
-    cells: NDArray
-    nb_box_idxs: NDArray   # array indices (0..N-1) per cell membership
-    ids: NDArray             # ids[array_idx] -> original id (e.g. precursor_idx)
+class Boxes:
+    """
+    2D box parametrized by center +- scale * multiplier.
+    """
     xcenters: NDArray
     ycenters: NDArray
     xscales: NDArray
     yscales: NDArray
     xmult: float
     ymult: float
+
+
+@dataclass
+class GridIndex:
+    cells: NDArray
+    nb_box_idxs: NDArray   # array indices (0..N-1) per cell membership
+    boxes: Boxes
     xwidth: int
     ywidth: int
 
     @classmethod
-    def from_xy(cls, xcenters, ycenters, xscales, yscales, xmult, ymult, ids):
-        xwidth = scales_to_width(xscales)
-        ywidth = scales_to_width(yscales)
+    def from_boxes(cls, boxes: Boxes):
+        xwidth = scales_to_width(boxes.xscales)
+        ywidth = scales_to_width(boxes.yscales)
         cells_cnt = lambda max_val, width: (int(max_val) + 1) // width + 1
-        idx = np.zeros(
-            (cells_cnt(xcenters.max(), xwidth), cells_cnt(ycenters.max(), ywidth) + 2),
+        cells = np.zeros(
+            (cells_cnt(boxes.xcenters.max(), xwidth), cells_cnt(boxes.ycenters.max(), ywidth) + 2),
             dtype=np.int64,
         )
-        count_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, idx)
-        total = inplace_start_pos(idx.ravel())
-        flat = np.empty(total, dtype=np.int64)
-        fill_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, idx, flat)
-        return cls(cells=idx, nb_box_idxs=flat, ids=np.asarray(ids),
-                   xcenters=xcenters, ycenters=ycenters, xscales=xscales, yscales=yscales,
-                   xmult=xmult, ymult=ymult, xwidth=xwidth, ywidth=ywidth)
+        count_box_content(boxes.xcenters, boxes.ycenters, boxes.xscales, boxes.yscales, boxes.xmult, boxes.ymult, xwidth, ywidth, cells)
+        total = inplace_start_pos(cells.ravel())
+        nb_box_idxs = np.empty(total, dtype=np.int64)
+        fill_box_content(boxes.xcenters, boxes.ycenters, boxes.xscales, boxes.yscales, boxes.xmult, boxes.ymult, xwidth, ywidth, cells, nb_box_idxs)
+        return cls(cells, nb_box_idxs, boxes, xwidth, ywidth)
 
-    def query(self, xcenters, ycenters, xscales, yscales, processor, *processor_args):
-        _visit_intersections(
-            xcenters, ycenters, xscales, yscales,
-            self.xmult, self.ymult, self.xwidth, self.ywidth,
-            self.cells, self.nb_box_idxs,
-            self.xcenters, self.ycenters, self.xscales, self.yscales,
-            processor, processor_args,
+    def query(self, query_boxes: Boxes, processor, *processor_args):
+        """Call processor(n, k, *processor_args) for every (query n, indexed k) intersecting pair.
+        Each pair visited exactly once via canonical-cell rule. Parallel: processor must write only to output[n]."""
+        stream_cells_parallel(
+            query_boxes.xcenters, query_boxes.ycenters, query_boxes.xscales, query_boxes.yscales,
+            self.boxes.xmult, self.boxes.ymult, self.xwidth, self.ywidth,
+            self.cells, _visit_proc,
+            (self.cells, self.nb_box_idxs,
+             self.boxes.xcenters, self.boxes.ycenters, self.boxes.xscales, self.boxes.yscales,
+             self.boxes.xmult, self.boxes.ymult, self.xwidth, self.ywidth,
+             processor, processor_args),
         )
 
 
@@ -263,16 +274,29 @@ if __name__ == "__main__":
         ]
     )
 
-    frame_scan_grid_idx = GridIndex.from_xy(
+    frame_scan_boxes = Boxes(
         xcenters=data.frame,
         ycenters=data.scan,
         xscales=data.frame_scale,
         yscales=data.scan_scale,
         xmult=cfg.frame_mult,
         ymult=cfg.scan_mult,
-        ids=data.precursor_idx,
     )
+    frame_scan_grid_idx = GridIndex.from_boxes(frame_scan_boxes)
 
+    counts = np.zeros(len(data.frame), dtype=np.int64)
+    frame_scan_grid_idx.query(
+        frame_scan_grid_idx.boxes,
+        count_2d_intersections,
+        counts,
+        frame_scan_grid_idx.boxes.xcenters,
+        frame_scan_grid_idx.boxes.ycenters,
+        frame_scan_grid_idx.boxes.xscales,
+        frame_scan_grid_idx.boxes.yscales,
+        frame_scan_grid_idx.boxes.xmult,
+        frame_scan_grid_idx.boxes.ymult,
+    )
+    print("intersection counts:", counts[:10])
 
     # The problem
 
