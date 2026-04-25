@@ -121,25 +121,41 @@ def hi_cell_idx(center, radius, inverse_width, highest_cell_idx):
     return min(int((center + radius) * inverse_width) + 1, highest_cell_idx)
 
 
-def _stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, cells, processor, progress, *processor_args):
-    """Iterate all boxes and their overlapping cells, calling processor(n, i, j, imin, jmin, *processor_args).
-    Pass progress=None to skip updates."""
+def make_box_order(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth):
+    """Return argsort by (imin, jmin) cell so spatially close boxes land in the same batch."""
+    inv_xw = 1.0 / xwidth
+    inv_yw = 1.0 / ywidth
+    imin = np.maximum(((xcenters - xmult * xscales) * inv_xw).astype(np.int64), 0)
+    jmin = np.maximum(((ycenters - ymult * yscales) * inv_yw).astype(np.int64), 0)
+    ny = int(np.max(ycenters) * inv_yw) + 2
+    return np.argsort(imin * ny + jmin, kind='stable').astype(np.int64)
+
+
+def _stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, cells, order, batch_size, processor, progress, *processor_args):
+    """Iterate boxes in batches (spatially sorted via order), calling processor(n, i, j, imin, jmin, *processor_args).
+    Parallel: each batch is a prange unit; sequential inner loop gives cache locality within a batch."""
     inv_xw = 1 / xwidth
     inv_yw = 1 / ywidth
     xhi = cells.shape[0]
     yhi = cells.shape[1] - 1
-    for n in numba.prange(len(xcenters)):
-        xc = xcenters[n]; yc = ycenters[n]
-        xs = xscales[n];  ys = yscales[n]
-        imin = lo_cell_idx(xc, xmult*xs, inv_xw)
-        jmin = lo_cell_idx(yc, ymult*ys, inv_yw)
-        itop = hi_cell_idx(xc, xmult*xs, inv_xw, xhi)
-        jtop = hi_cell_idx(yc, ymult*ys, inv_yw, yhi)
-        for i in range(imin, itop):
-            for j in range(jmin, jtop):
-                processor(n, i, j, imin, jmin, *processor_args)
-        if progress is not None and n % 1000 == 0:
-            progress.update(1000)
+    n_boxes = len(order)
+    n_batches = (n_boxes + batch_size - 1) // batch_size
+    for batch in numba.prange(n_batches):
+        start = batch * batch_size
+        end = min(start + batch_size, n_boxes)
+        for idx in range(start, end):
+            n = order[idx]
+            xc = xcenters[n]; yc = ycenters[n]
+            xs = xscales[n];  ys = yscales[n]
+            imin = lo_cell_idx(xc, xmult*xs, inv_xw)
+            jmin = lo_cell_idx(yc, ymult*ys, inv_yw)
+            itop = hi_cell_idx(xc, xmult*xs, inv_xw, xhi)
+            jtop = hi_cell_idx(yc, ymult*ys, inv_yw, yhi)
+            for i in range(imin, itop):
+                for j in range(jmin, jtop):
+                    processor(n, i, j, imin, jmin, *processor_args)
+        if progress is not None:
+            progress.update(end - start)
 
 stream_cells = numba.njit(_stream_cells)
 stream_cells_parallel = numba.njit(parallel=True)(_stream_cells)
@@ -197,17 +213,15 @@ def count_3d_intersections(n, k, counts, xcenters, ycenters, xscales, yscales, x
         counts[n] += 1
 
 
-@numba.njit(boundscheck=True)
-def count_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, out, progress=None):
+def count_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, out, order, batch_size, progress=None):
     """Increment out[i,j] for every grid cell each box overlaps. First pass of CSR build."""
-    stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, out, _count_proc, progress, out)
+    stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, out, order, batch_size, _count_proc, progress, out)
 
 
-@numba.njit(boundscheck=True)
-def fill_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, idx, flat, progress=None):
+def fill_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, idx, flat, order, batch_size, progress=None):
     """Write array index into flat for every cell it overlaps. Second pass of CSR build."""
     cursors = np.zeros_like(idx)
-    stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, idx, _fill_proc, progress, idx, flat, cursors)
+    stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, idx, order, batch_size, _fill_proc, progress, idx, flat, cursors)
 
 
 @dataclass
@@ -232,27 +246,29 @@ class GridIndex:
     ywidth: int
 
     @classmethod
-    def from_boxes(cls, boxes: Boxes, progress=None):
+    def from_boxes(cls, boxes: Boxes, batch_size: int = 64, progress=None):
         xwidth = scales_to_width(boxes.xscales)
         ywidth = scales_to_width(boxes.yscales)
+        order = make_box_order(boxes.xcenters, boxes.ycenters, boxes.xscales, boxes.yscales, boxes.xmult, boxes.ymult, xwidth, ywidth)
         cells_cnt = lambda max_val, width: (int(max_val) + 1) // width + 1
         cells = np.zeros(
             (cells_cnt(boxes.xcenters.max(), xwidth), cells_cnt(boxes.ycenters.max(), ywidth) + 2),
             dtype=np.int64,
         )
-        count_box_content(boxes.xcenters, boxes.ycenters, boxes.xscales, boxes.yscales, boxes.xmult, boxes.ymult, xwidth, ywidth, cells, progress)
+        count_box_content(boxes.xcenters, boxes.ycenters, boxes.xscales, boxes.yscales, boxes.xmult, boxes.ymult, xwidth, ywidth, cells, order, batch_size, progress)
         total = inplace_start_pos(cells.ravel())
         nb_box_idxs = np.empty(total, dtype=np.int64)
-        fill_box_content(boxes.xcenters, boxes.ycenters, boxes.xscales, boxes.yscales, boxes.xmult, boxes.ymult, xwidth, ywidth, cells, nb_box_idxs, progress)
+        fill_box_content(boxes.xcenters, boxes.ycenters, boxes.xscales, boxes.yscales, boxes.xmult, boxes.ymult, xwidth, ywidth, cells, nb_box_idxs, order, batch_size, progress)
         return cls(cells, nb_box_idxs, boxes, xwidth, ywidth)
 
-    def query(self, query_boxes: Boxes, processor, *processor_args, progress=None):
+    def query(self, query_boxes: Boxes, processor, *processor_args, batch_size: int = 64, progress=None):
         """Call processor(n, k, *processor_args) for every (query n, indexed k) intersecting pair.
         Each pair visited exactly once via canonical-cell rule. Parallel: processor must write only to output[n]."""
+        order = make_box_order(query_boxes.xcenters, query_boxes.ycenters, query_boxes.xscales, query_boxes.yscales, self.boxes.xmult, self.boxes.ymult, self.xwidth, self.ywidth)
         stream_cells_parallel(
             query_boxes.xcenters, query_boxes.ycenters, query_boxes.xscales, query_boxes.yscales,
             self.boxes.xmult, self.boxes.ymult, self.xwidth, self.ywidth,
-            self.cells, _visit_proc, progress,
+            self.cells, order, batch_size, _visit_proc, progress,
             self.cells, self.nb_box_idxs,
             self.boxes.xcenters, self.boxes.ycenters, self.boxes.xscales, self.boxes.yscales,
             self.boxes.xmult, self.boxes.ymult, self.xwidth, self.ywidth,
@@ -332,12 +348,5 @@ if __name__ == "__main__":
     # B6699 - longer gradient
 
 """
-In git/boxing/__dev/deslop2.py I have frames and scans that are ints. 
-I want to construct a 2D index for box intersection querries.
-I want that by 
-
-to that end I want to corsify the grid of     
-  points that boxes occupy. Each box is define by center x and y position (data.frame adn data.scan).   
-  I have already corse width {frame,scan}_box_width. I have {scan,frame}.{min,max,box_width} and want   
-  to use those to define grid. The grid should allow for representing all boxes. One box i   
+In git/boxing/__dev/deslop2.py
 """
