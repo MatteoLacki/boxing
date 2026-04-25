@@ -121,9 +121,9 @@ def hi_cell_idx(center, radius, inverse_width, highest_cell_idx):
     return min(int((center + radius) * inverse_width) + 1, highest_cell_idx)
 
 
-def _stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, cells, processor, processor_args):
+def _stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, cells, processor, progress, *processor_args):
     """Iterate all boxes and their overlapping cells, calling processor(n, i, j, imin, jmin, *processor_args).
-    Single-threaded: safe for processors with shared mutable state (build phase)."""
+    Pass progress=None to skip updates."""
     inv_xw = 1 / xwidth
     inv_yw = 1 / ywidth
     xhi = cells.shape[0]
@@ -138,6 +138,8 @@ def _stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, yw
         for i in range(imin, itop):
             for j in range(jmin, jtop):
                 processor(n, i, j, imin, jmin, *processor_args)
+        if progress is not None and n % 1000 == 0:
+            progress.update(1000)
 
 stream_cells = numba.njit(_stream_cells)
 stream_cells_parallel = numba.njit(parallel=True)(_stream_cells)
@@ -158,7 +160,7 @@ def _fill_proc(n, i, j, imin, jmin, idx, flat, cursors):
 @numba.njit
 def _visit_proc(n, i, j, imin, jmin, cells, nb_box_idxs,
                 idx_xcenters, idx_ycenters, idx_xscales, idx_yscales,
-                xmult, ymult, xwidth, ywidth, processor, processor_args):
+                xmult, ymult, xwidth, ywidth, processor, *processor_args):
     """Canonical-cell dedup then call inner processor(n, k, *processor_args) for each true neighbor k."""
     inv_xw = 1 / xwidth
     inv_yw = 1 / ywidth
@@ -182,17 +184,30 @@ def count_2d_intersections(n, k, counts, xcenters, ycenters, xscales, yscales, x
         counts[n] += 1
 
 
+@numba.njit
+def count_3d_intersections(n, k, counts, xcenters, ycenters, xscales, yscales, xmult, ymult, mz, mz_radius_da):
+    """count_2d_intersections + mz box overlap gate. Race-free: writes only to counts[n]."""
+    if abs(mz[n] - mz[k]) >= 2.0 * mz_radius_da:
+        return
+    xlo_n = xcenters[n] - xmult * xscales[n]; xhi_n = xcenters[n] + xmult * xscales[n]
+    ylo_n = ycenters[n] - ymult * yscales[n]; yhi_n = ycenters[n] + ymult * yscales[n]
+    xlo_k = xcenters[k] - xmult * xscales[k]; xhi_k = xcenters[k] + xmult * xscales[k]
+    ylo_k = ycenters[k] - ymult * yscales[k]; yhi_k = ycenters[k] + ymult * yscales[k]
+    if xlo_n < xhi_k and xlo_k < xhi_n and ylo_n < yhi_k and ylo_k < yhi_n:
+        counts[n] += 1
+
+
 @numba.njit(boundscheck=True)
-def count_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, out):
+def count_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, out, progress=None):
     """Increment out[i,j] for every grid cell each box overlaps. First pass of CSR build."""
-    stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, out, _count_proc, (out,))
+    stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, out, _count_proc, progress, out)
 
 
 @numba.njit(boundscheck=True)
-def fill_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, idx, flat):
+def fill_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, idx, flat, progress=None):
     """Write array index into flat for every cell it overlaps. Second pass of CSR build."""
     cursors = np.zeros_like(idx)
-    stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, idx, _fill_proc, (idx, flat, cursors))
+    stream_cells(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, idx, _fill_proc, progress, idx, flat, cursors)
 
 
 @dataclass
@@ -217,7 +232,7 @@ class GridIndex:
     ywidth: int
 
     @classmethod
-    def from_boxes(cls, boxes: Boxes):
+    def from_boxes(cls, boxes: Boxes, progress=None):
         xwidth = scales_to_width(boxes.xscales)
         ywidth = scales_to_width(boxes.yscales)
         cells_cnt = lambda max_val, width: (int(max_val) + 1) // width + 1
@@ -225,23 +240,23 @@ class GridIndex:
             (cells_cnt(boxes.xcenters.max(), xwidth), cells_cnt(boxes.ycenters.max(), ywidth) + 2),
             dtype=np.int64,
         )
-        count_box_content(boxes.xcenters, boxes.ycenters, boxes.xscales, boxes.yscales, boxes.xmult, boxes.ymult, xwidth, ywidth, cells)
+        count_box_content(boxes.xcenters, boxes.ycenters, boxes.xscales, boxes.yscales, boxes.xmult, boxes.ymult, xwidth, ywidth, cells, progress)
         total = inplace_start_pos(cells.ravel())
         nb_box_idxs = np.empty(total, dtype=np.int64)
-        fill_box_content(boxes.xcenters, boxes.ycenters, boxes.xscales, boxes.yscales, boxes.xmult, boxes.ymult, xwidth, ywidth, cells, nb_box_idxs)
+        fill_box_content(boxes.xcenters, boxes.ycenters, boxes.xscales, boxes.yscales, boxes.xmult, boxes.ymult, xwidth, ywidth, cells, nb_box_idxs, progress)
         return cls(cells, nb_box_idxs, boxes, xwidth, ywidth)
 
-    def query(self, query_boxes: Boxes, processor, *processor_args):
+    def query(self, query_boxes: Boxes, processor, *processor_args, progress=None):
         """Call processor(n, k, *processor_args) for every (query n, indexed k) intersecting pair.
         Each pair visited exactly once via canonical-cell rule. Parallel: processor must write only to output[n]."""
         stream_cells_parallel(
             query_boxes.xcenters, query_boxes.ycenters, query_boxes.xscales, query_boxes.yscales,
             self.boxes.xmult, self.boxes.ymult, self.xwidth, self.ywidth,
-            self.cells, _visit_proc,
-            (self.cells, self.nb_box_idxs,
-             self.boxes.xcenters, self.boxes.ycenters, self.boxes.xscales, self.boxes.yscales,
-             self.boxes.xmult, self.boxes.ymult, self.xwidth, self.ywidth,
-             processor, processor_args),
+            self.cells, _visit_proc, progress,
+            self.cells, self.nb_box_idxs,
+            self.boxes.xcenters, self.boxes.ycenters, self.boxes.xscales, self.boxes.yscales,
+            self.boxes.xmult, self.boxes.ymult, self.xwidth, self.ywidth,
+            processor, *processor_args,
         )
 
 
@@ -282,22 +297,34 @@ if __name__ == "__main__":
         xmult=cfg.frame_mult,
         ymult=cfg.scan_mult,
     )
-    frame_scan_grid_idx = GridIndex.from_boxes(frame_scan_boxes)
+    N = len(data.frame)
+    with ProgressBar(total=N, desc="build index") as progress:
+        frame_scan_grid_idx = GridIndex.from_boxes(frame_scan_boxes, progress=progress)
 
-    counts = np.zeros(len(data.frame), dtype=np.int64)
-    frame_scan_grid_idx.query(
-        frame_scan_grid_idx.boxes,
-        count_2d_intersections,
-        counts,
-        frame_scan_grid_idx.boxes.xcenters,
-        frame_scan_grid_idx.boxes.ycenters,
-        frame_scan_grid_idx.boxes.xscales,
-        frame_scan_grid_idx.boxes.yscales,
-        frame_scan_grid_idx.boxes.xmult,
-        frame_scan_grid_idx.boxes.ymult,
-    )
-    print("intersection counts:", counts[:10])
+    b = frame_scan_grid_idx.boxes
+    counts = np.zeros(N, dtype=np.int64)
+    with ProgressBar(total=N, desc="count intersections") as progress:
+        frame_scan_grid_idx.query(
+            b, count_2d_intersections,
+            counts, b.xcenters, b.ycenters, b.xscales, b.yscales, b.xmult, b.ymult,
+            progress=progress,
+        )
+    print("2D intersection counts:", counts[:10])
 
+    counts3d = np.zeros(N, dtype=np.int64)
+    with ProgressBar(total=N, desc="count 3D intersections") as progress:
+        frame_scan_grid_idx.query(
+            b, count_3d_intersections,
+            counts3d, b.xcenters, b.ycenters, b.xscales, b.yscales, b.xmult, b.ymult,
+            data.mz, mz_radius_da,
+            progress=progress,
+        )
+    print("3D intersection counts:", counts3d[:10])
+
+    from timstofu.stats import count1D
+    from timstofu.plotting import plot_counts
+
+    plot_counts(count1D(counts), xlog=False, ylog=False)
     # The problem
 
     # F9477 -
