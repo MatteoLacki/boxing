@@ -28,6 +28,8 @@ Design notes
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import numpy as np
 import numba
 from numpy.typing import NDArray
@@ -60,6 +62,274 @@ def get_multiplied_median_bucket_widths(
     bw_xx = max(1, int(xx_factor * float(np.median(xx_widths))))
     bw_yy = max(1, int(yy_factor * float(np.median(yy_widths))))
     return bw_xx, bw_yy
+
+
+def scales_to_width(scales: NDArray, factor: float = 2.0) -> int:
+    """Bucket width = factor * 2 * median(scales), minimum 1."""
+    median_width = 2 * np.median(scales)
+    return max(1, int(factor * median_width))
+
+
+@numba.njit
+def inplace_start_pos(xx):
+    """Exclusive prefix sum of xx in-place. Returns the total."""
+    current = xx[0]
+    xx[0] = 0
+    for i in range(1, len(xx)):
+        nxt = xx[i]
+        xx[i] = current
+        current += nxt
+    return current
+
+
+@numba.njit
+def lo_cell_idx(center, radius, inverse_width, lowest_cell_idx=0):
+    return max(int((center - radius) * inverse_width), lowest_cell_idx)
+
+
+@numba.njit
+def hi_cell_idx(center, radius, inverse_width, highest_cell_idx):
+    return min(int((center + radius) * inverse_width) + 1, highest_cell_idx)
+
+
+@numba.njit
+def _count_proc_3d(n, i, j, l, imin, jmin, lmin, out):
+    out[i, j, l] += 1
+
+
+@numba.njit
+def _fill_proc_3d(n, i, j, l, imin, jmin, lmin, idx, flat, cursors):
+    pos = idx[i, j, l] + cursors[i, j, l]
+    flat[pos] = n
+    cursors[i, j, l] += 1
+
+
+def _stream_cells_3d(
+    xcenters,
+    ycenters,
+    mz,
+    xscales,
+    yscales,
+    mz_radius_da,
+    mz_offset,
+    xmult,
+    ymult,
+    xwidth,
+    ywidth,
+    zwidth,
+    cells,
+    order,
+    batch_size,
+    processor,
+    progress,
+    *processor_args,
+):
+    inv_xw = 1.0 / xwidth
+    inv_yw = 1.0 / ywidth
+    inv_zw = 1.0 / zwidth
+    xhi = cells.shape[0]
+    yhi = cells.shape[1]
+    zhi = cells.shape[2] - 1
+    n_boxes = len(order)
+    n_batches = (n_boxes + batch_size - 1) // batch_size
+    for batch in numba.prange(n_batches):
+        start = batch * batch_size
+        end = min(start + batch_size, n_boxes)
+        for box_idx in range(start, end):
+            n = order[box_idx]
+            xc = xcenters[n]
+            yc = ycenters[n]
+            zc = mz[n]
+            xs = xscales[n]
+            ys = yscales[n]
+            imin = lo_cell_idx(xc, xmult * xs, inv_xw)
+            jmin = lo_cell_idx(yc, ymult * ys, inv_yw)
+            lmin = max(int((zc - mz_radius_da - mz_offset) * inv_zw), 0)
+            itop = hi_cell_idx(xc, xmult * xs, inv_xw, xhi)
+            jtop = hi_cell_idx(yc, ymult * ys, inv_yw, yhi)
+            ltop = min(int((zc + mz_radius_da - mz_offset) * inv_zw) + 1, zhi)
+            for i in range(imin, itop):
+                for j in range(jmin, jtop):
+                    for l in range(lmin, ltop):
+                        processor(n, i, j, l, imin, jmin, lmin, *processor_args)
+        if progress is not None:
+            progress.update(end - start)
+
+
+stream_cells_3d = numba.njit(_stream_cells_3d)
+stream_cells_3d_parallel = numba.njit(parallel=True)(_stream_cells_3d)
+
+
+@numba.njit
+def _visit_proc_3d(
+    n,
+    i,
+    j,
+    l,
+    imin,
+    jmin,
+    lmin,
+    cells,
+    nb_box_idxs,
+    idx_xcenters,
+    idx_ycenters,
+    idx_mz,
+    idx_xscales,
+    idx_yscales,
+    idx_mz_radius_da,
+    idx_mz_offset,
+    xmult,
+    ymult,
+    xwidth,
+    ywidth,
+    zwidth,
+    processor,
+    *processor_args,
+):
+    inv_xw = 1.0 / xwidth
+    inv_yw = 1.0 / ywidth
+    inv_zw = 1.0 / zwidth
+    for pos in range(cells[i, j, l], cells[i, j, l + 1]):
+        k = nb_box_idxs[pos]
+        nb_lx = lo_cell_idx(idx_xcenters[k], xmult * idx_xscales[k], inv_xw)
+        nb_ly = lo_cell_idx(idx_ycenters[k], ymult * idx_yscales[k], inv_yw)
+        nb_lz = max(int((idx_mz[k] - idx_mz_radius_da - idx_mz_offset) * inv_zw), 0)
+        if i != max(imin, nb_lx) or j != max(jmin, nb_ly) or l != max(lmin, nb_lz):
+            continue
+        processor(n, k, *processor_args)
+
+
+@dataclass
+class Boxes3D:
+    """3D frame x scan x m/z boxes used by the C++ precursor-neighbor index."""
+
+    xcenters: NDArray
+    ycenters: NDArray
+    mz: NDArray
+    xscales: NDArray
+    yscales: NDArray
+    mz_radius_da: float
+    xmult: float
+    ymult: float
+    order: NDArray = field(init=False)
+    mz_offset: float = field(init=False)
+
+    def __post_init__(self):
+        xlo = self.xcenters - self.xmult * self.xscales
+        ylo = self.ycenters - self.ymult * self.yscales
+        mz_lo = self.mz - self.mz_radius_da
+        self.mz_offset = float(mz_lo.min())
+        self.order = np.lexsort((mz_lo, ylo, xlo)).astype(np.int64)
+
+
+@dataclass
+class GridIndex3D:
+    cells: NDArray
+    nb_box_idxs: NDArray
+    boxes: Boxes3D
+    xwidth: int
+    ywidth: int
+    zwidth: float
+
+    @classmethod
+    def from_boxes(cls, boxes: Boxes3D, batch_size: int = 64, progress=None):
+        xwidth = scales_to_width(boxes.xscales)
+        ywidth = scales_to_width(boxes.yscales)
+        zwidth = 2.0 * boxes.mz_radius_da
+
+        def cnt_xy(max_val, width):
+            return (int(max_val) + 1) // width + 1
+
+        bx = cnt_xy(int(boxes.xcenters.max()), xwidth)
+        by = cnt_xy(int(boxes.ycenters.max()), ywidth)
+        mz_hi_range = float((boxes.mz + boxes.mz_radius_da).max()) - boxes.mz_offset
+        bz = int(mz_hi_range / zwidth) + 2
+
+        cells = np.zeros((bx, by, bz + 1), dtype=np.int64)
+        stream_cells_3d(
+            boxes.xcenters,
+            boxes.ycenters,
+            boxes.mz,
+            boxes.xscales,
+            boxes.yscales,
+            boxes.mz_radius_da,
+            boxes.mz_offset,
+            boxes.xmult,
+            boxes.ymult,
+            xwidth,
+            ywidth,
+            zwidth,
+            cells,
+            boxes.order,
+            batch_size,
+            _count_proc_3d,
+            progress,
+            cells,
+        )
+        total = inplace_start_pos(cells.ravel())
+        nb_box_idxs = np.empty(total, dtype=np.int64)
+        cursors = np.zeros_like(cells)
+        stream_cells_3d(
+            boxes.xcenters,
+            boxes.ycenters,
+            boxes.mz,
+            boxes.xscales,
+            boxes.yscales,
+            boxes.mz_radius_da,
+            boxes.mz_offset,
+            boxes.xmult,
+            boxes.ymult,
+            xwidth,
+            ywidth,
+            zwidth,
+            cells,
+            boxes.order,
+            batch_size,
+            _fill_proc_3d,
+            progress,
+            cells,
+            nb_box_idxs,
+            cursors,
+        )
+        return cls(cells, nb_box_idxs, boxes, xwidth, ywidth, zwidth)
+
+    def query(self, query_boxes: Boxes3D, processor, *processor_args, batch_size: int = 64, progress=None):
+        """Call processor(n, k, *args) for every indexed 3D box pair exactly once."""
+        stream_cells_3d_parallel(
+            query_boxes.xcenters,
+            query_boxes.ycenters,
+            query_boxes.mz,
+            query_boxes.xscales,
+            query_boxes.yscales,
+            query_boxes.mz_radius_da,
+            query_boxes.mz_offset,
+            self.boxes.xmult,
+            self.boxes.ymult,
+            self.xwidth,
+            self.ywidth,
+            self.zwidth,
+            self.cells,
+            query_boxes.order,
+            batch_size,
+            _visit_proc_3d,
+            progress,
+            self.cells,
+            self.nb_box_idxs,
+            self.boxes.xcenters,
+            self.boxes.ycenters,
+            self.boxes.mz,
+            self.boxes.xscales,
+            self.boxes.yscales,
+            self.boxes.mz_radius_da,
+            self.boxes.mz_offset,
+            self.boxes.xmult,
+            self.boxes.ymult,
+            self.xwidth,
+            self.ywidth,
+            self.zwidth,
+            processor,
+            *processor_args,
+        )
 
 
 # ---------------------------------------------------------------------------

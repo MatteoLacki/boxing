@@ -26,7 +26,8 @@ dependencies = [
 
 [project.scripts]
 example_shell_script = "boxing.cli.example_shell_script:example_shell_script"
-precursor-neighbors = "boxing.cli.precursor_neighbors:main"
+build-precursor-grid-index = "boxing.cli.build_precursor_grid_index:main"
+precursor-neighbors-params = "boxing.cli.precursor_neighbors_params:main"
 
 [project.urls]
 homepage="https://github.com/MatteoLacki/boxing.git"

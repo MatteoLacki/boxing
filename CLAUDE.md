@@ -9,8 +9,9 @@ src/boxing/
 ├── utils.py                # counting sort, dtype helpers (Numba)
 ├── testing.py              # brute-force validators and reference implementations
 ├── __init__.py             # public API re-exports
+├── precursor_neighbors_config.py # config and DIA metadata helpers
 └── cli/
-    └── precursor_neighbors.py  # precursor-neighbors CLI (pipeline entry point)
+    └── build_precursor_grid_index.py # C++ precursor-neighbor grid builder
 
 tests/
 ├── test_spatial_index.py
@@ -22,7 +23,7 @@ configs/precursor_neighbors/
 
 Entry point registered in `pyproject.toml`:
 ```
-precursor-neighbors = boxing.cli.precursor_neighbors:main
+build-precursor-grid-index = boxing.cli.build_precursor_grid_index:main
 ```
 
 ---
@@ -71,9 +72,9 @@ Converts dense (N, K) arrays to CSR. When `prec_to_row` provided, offsets are in
 
 ---
 
-## CLI: `precursor_neighbors.py`
+## CLI: `build_precursor_grid_index.py`
 
-Reads precursor parquet, reads DIA isolation width from OpenTIMS, passes frame/scan/mz centers plus frame/scan scales and m/z radii to `find_top_k_neighbors_2d_zz`, then writes CSR mmappet output.
+Reads precursor parquet, reads DIA isolation width from OpenTIMS, builds a 3D grid index, and writes mmappet inputs consumed by the C++ precursor-neighbor binary.
 
 ### `PrecursorNeighborsConfig` (Pydantic)
 
@@ -88,13 +89,15 @@ Reads precursor parquet, reads DIA isolation width from OpenTIMS, passes frame/s
 | `geometry` | "box" | "box" or "cylinder" | first-two-dimension support geometry |
 | `cylinder_radius` | 1.0 | gt=0 | normalized 2D cylinder radius when `geometry="cylinder"` |
 
-Config loaded from `--config TOML` (optional). Falls back to model defaults when omitted.
+Config loaded from required `--config TOML`.
 Config validated by `check_configs` pipeline rule via `scripts/check_configs.py`.
 
 ### Output
-Directory with two mmappet datasets:
-- `neighbors.mmappet` — `prec_idx` (int32), `intensity` (int64)
-- `index.mmappet` — `offset` (int64)
+Directory with grid-index inputs:
+- `boxes.mmappet` — sorted precursor boxes and payload columns
+- `cells.mmappet` — flattened cell offsets
+- `nb_idxs.mmappet` — flattened cell member indices
+- `grid_meta.txt` — grid shape, bucket widths, and m/z offset
 
 ---
 

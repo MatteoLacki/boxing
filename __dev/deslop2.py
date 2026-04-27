@@ -69,7 +69,10 @@ from numba_progress import ProgressBar
 from numpy.typing import NDArray
 from pandas_ops.io import read_df
 
-from boxing.cli.precursor_neighbors import _load_config, _read_isolation_mz_radius_da
+from boxing.precursor_neighbors_config import (
+    read_isolation_mz_radius_da,
+    validate_config,
+)
 from boxing.spatial_index import dense_neighbors_to_csr, find_top_k_neighbors_2d_zz
 from boxing.spatial_index import _build_offsets, _geometry_to_use_cylinder
 from boxing.utils import argcountsort, count1D
@@ -498,10 +501,10 @@ if __name__ == "__main__":
     out_path = Path("/home/matteo/tmp/F9477nbs.mmappet")
 
 
-    cfg = _load_config(config_path)
+    cfg = validate_config(config_path)
     prec = read_df(precursors_path)
 
-    mz_radius_da = _read_isolation_mz_radius_da(OpenTIMS(dataset_path))
+    mz_radius_da = read_isolation_mz_radius_da(OpenTIMS(dataset_path))
 
     data = dictodot.df2dd(
         prec[
