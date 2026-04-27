@@ -201,13 +201,7 @@ def count_2d_intersections(n, k, counts, xcenters, ycenters, xscales, yscales, x
 
 
 @numba.njit
-def count_3d_intersections(n, k, counts, xcenters, ycenters, xscales, yscales, xmult, ymult, mz, mz_radius_da, geometry):
-    """count_2d_intersections + mz box overlap gate + optional geometry filter.
-
-    geometry: 0=box, 1=cylinder (xy ellipse), 2=ellipsoid (xy + mz).
-    Ellipse radii = average of the two boxes' radii in each dim.
-    Race-free: writes only to counts[n].
-    """
+def _count_3d_box(n, k, counts, xcenters, ycenters, xscales, yscales, xmult, ymult, mz, mz_radius_da):
     if abs(mz[n] - mz[k]) >= 2.0 * mz_radius_da:
         return
     xlo_n = xcenters[n] - xmult * xscales[n]; xhi_n = xcenters[n] + xmult * xscales[n]
@@ -216,18 +210,60 @@ def count_3d_intersections(n, k, counts, xcenters, ycenters, xscales, yscales, x
     ylo_k = ycenters[k] - ymult * yscales[k]; yhi_k = ycenters[k] + ymult * yscales[k]
     if not (xlo_n < xhi_k and xlo_k < xhi_n and ylo_n < yhi_k and ylo_k < yhi_n):
         return
-    if geometry >= 1:
-        rx = xmult * (xscales[n] + xscales[k]) * 0.5
-        ry = ymult * (yscales[n] + yscales[k]) * 0.5
-        dx = xcenters[n] - xcenters[k]
-        dy = ycenters[n] - ycenters[k]
-        if dx*dx/(rx*rx) + dy*dy/(ry*ry) > 1.0:
-            return
-        if geometry == 2:
-            dz = mz[n] - mz[k]
-            if dz*dz/(mz_radius_da*mz_radius_da) > 1.0:
-                return
     counts[n] += 1
+
+
+@numba.njit
+def _count_3d_cylinder(n, k, counts, xcenters, ycenters, xscales, yscales, xmult, ymult, mz, mz_radius_da):
+    if abs(mz[n] - mz[k]) >= 2.0 * mz_radius_da:
+        return
+    xlo_n = xcenters[n] - xmult * xscales[n]; xhi_n = xcenters[n] + xmult * xscales[n]
+    ylo_n = ycenters[n] - ymult * yscales[n]; yhi_n = ycenters[n] + ymult * yscales[n]
+    xlo_k = xcenters[k] - xmult * xscales[k]; xhi_k = xcenters[k] + xmult * xscales[k]
+    ylo_k = ycenters[k] - ymult * yscales[k]; yhi_k = ycenters[k] + ymult * yscales[k]
+    if not (xlo_n < xhi_k and xlo_k < xhi_n and ylo_n < yhi_k and ylo_k < yhi_n):
+        return
+    rx = xmult * (xscales[n] + xscales[k]) * 0.5
+    ry = ymult * (yscales[n] + yscales[k]) * 0.5
+    dx = xcenters[n] - xcenters[k]
+    dy = ycenters[n] - ycenters[k]
+    if dx*dx/(rx*rx) + dy*dy/(ry*ry) > 1.0:
+        return
+    counts[n] += 1
+
+
+@numba.njit
+def _count_3d_ellipsoid(n, k, counts, xcenters, ycenters, xscales, yscales, xmult, ymult, mz, mz_radius_da):
+    if abs(mz[n] - mz[k]) >= 2.0 * mz_radius_da:
+        return
+    xlo_n = xcenters[n] - xmult * xscales[n]; xhi_n = xcenters[n] + xmult * xscales[n]
+    ylo_n = ycenters[n] - ymult * yscales[n]; yhi_n = ycenters[n] + ymult * yscales[n]
+    xlo_k = xcenters[k] - xmult * xscales[k]; xhi_k = xcenters[k] + xmult * xscales[k]
+    ylo_k = ycenters[k] - ymult * yscales[k]; yhi_k = ycenters[k] + ymult * yscales[k]
+    if not (xlo_n < xhi_k and xlo_k < xhi_n and ylo_n < yhi_k and ylo_k < yhi_n):
+        return
+    rx = xmult * (xscales[n] + xscales[k]) * 0.5
+    ry = ymult * (yscales[n] + yscales[k]) * 0.5
+    dx = xcenters[n] - xcenters[k]
+    dy = ycenters[n] - ycenters[k]
+    if dx*dx/(rx*rx) + dy*dy/(ry*ry) > 1.0:
+        return
+    dz = mz[n] - mz[k]
+    if dz*dz/(mz_radius_da*mz_radius_da) > 1.0:
+        return
+    counts[n] += 1
+
+
+_COUNT_3D = {
+    Geometry.BOX: _count_3d_box,
+    Geometry.CYLINDER: _count_3d_cylinder,
+    Geometry.ELLIPSOID: _count_3d_ellipsoid,
+}
+
+
+def count_3d_intersections(geometry: Geometry):
+    """Return the branch-free specialized processor for the given geometry."""
+    return _COUNT_3D[geometry]
 
 
 def count_box_content(xcenters, ycenters, xscales, yscales, xmult, ymult, xwidth, ywidth, out, order, batch_size, progress=None):
@@ -295,6 +331,163 @@ class GridIndex:
         )
 
 
+@numba.njit
+def _count_proc_3d(n, i, j, l, imin, jmin, lmin, out):
+    out[i, j, l] += 1
+
+
+@numba.njit
+def _fill_proc_3d(n, i, j, l, imin, jmin, lmin, idx, flat, cursors):
+    pos = idx[i, j, l] + cursors[i, j, l]
+    flat[pos] = n
+    cursors[i, j, l] += 1
+
+
+def _stream_cells_3d(
+    xcenters, ycenters, mz, xscales, yscales,
+    mz_radius_da, mz_offset,
+    xmult, ymult,
+    xwidth, ywidth, zwidth,
+    cells, order, batch_size,
+    processor, progress, *processor_args,
+):
+    inv_xw = 1.0 / xwidth
+    inv_yw = 1.0 / ywidth
+    inv_zw = 1.0 / zwidth
+    xhi = cells.shape[0]
+    yhi = cells.shape[1]
+    zhi = cells.shape[2] - 1
+    n_boxes = len(order)
+    n_batches = (n_boxes + batch_size - 1) // batch_size
+    for batch in numba.prange(n_batches):
+        start = batch * batch_size
+        end = min(start + batch_size, n_boxes)
+        for box_idx in range(start, end):
+            n = order[box_idx]
+            xc = xcenters[n]; yc = ycenters[n]; zc = mz[n]
+            xs = xscales[n]; ys = yscales[n]
+            imin = lo_cell_idx(xc, xmult * xs, inv_xw)
+            jmin = lo_cell_idx(yc, ymult * ys, inv_yw)
+            lmin = max(int((zc - mz_radius_da - mz_offset) * inv_zw), 0)
+            itop = hi_cell_idx(xc, xmult * xs, inv_xw, xhi)
+            jtop = hi_cell_idx(yc, ymult * ys, inv_yw, yhi)
+            ltop = min(int((zc + mz_radius_da - mz_offset) * inv_zw) + 1, zhi)
+            for i in range(imin, itop):
+                for j in range(jmin, jtop):
+                    for l in range(lmin, ltop):
+                        processor(n, i, j, l, imin, jmin, lmin, *processor_args)
+        if progress is not None:
+            progress.update(end - start)
+
+
+stream_cells_3d = numba.njit(_stream_cells_3d)
+stream_cells_3d_parallel = numba.njit(parallel=True)(_stream_cells_3d)
+
+
+@numba.njit
+def _visit_proc_3d(n, i, j, l, imin, jmin, lmin,
+                   cells, nb_box_idxs,
+                   idx_xcenters, idx_ycenters, idx_mz,
+                   idx_xscales, idx_yscales,
+                   idx_mz_radius_da, idx_mz_offset,
+                   xmult, ymult,
+                   xwidth, ywidth, zwidth,
+                   processor, *processor_args):
+    inv_xw = 1.0 / xwidth
+    inv_yw = 1.0 / ywidth
+    inv_zw = 1.0 / zwidth
+    for pos in range(cells[i, j, l], cells[i, j, l + 1]):
+        k = nb_box_idxs[pos]
+        nb_lx = lo_cell_idx(idx_xcenters[k], xmult * idx_xscales[k], inv_xw)
+        nb_ly = lo_cell_idx(idx_ycenters[k], ymult * idx_yscales[k], inv_yw)
+        nb_lz = max(int((idx_mz[k] - idx_mz_radius_da - idx_mz_offset) * inv_zw), 0)
+        if i != max(imin, nb_lx) or j != max(jmin, nb_ly) or l != max(lmin, nb_lz):
+            continue
+        processor(n, k, *processor_args)
+
+
+@dataclass
+class Boxes3D:
+    """3D box: frame × scan × mz, parametrized by center ± scale * multiplier (xy) and mz_radius_da (z)."""
+    xcenters: NDArray
+    ycenters: NDArray
+    mz: NDArray
+    xscales: NDArray
+    yscales: NDArray
+    mz_radius_da: float
+    xmult: float
+    ymult: float
+    order: NDArray = field(init=False)
+    mz_offset: float = field(init=False)
+
+    def __post_init__(self):
+        xlo = self.xcenters - self.xmult * self.xscales
+        ylo = self.ycenters - self.ymult * self.yscales
+        mz_lo = self.mz - self.mz_radius_da
+        self.mz_offset = float(mz_lo.min())
+        self.order = np.lexsort((mz_lo, ylo, xlo)).astype(np.int64)
+
+
+@dataclass
+class GridIndex3D:
+    cells: NDArray        # int64[BX, BY, BZ+1] CSR offsets
+    nb_box_idxs: NDArray  # int64[M]
+    boxes: Boxes3D
+    xwidth: int
+    ywidth: int
+    zwidth: float         # = 2 * mz_radius_da
+
+    @classmethod
+    def from_boxes(cls, boxes: Boxes3D, batch_size: int = 64, progress=None):
+        xwidth = scales_to_width(boxes.xscales)
+        ywidth = scales_to_width(boxes.yscales)
+        zwidth = 2.0 * boxes.mz_radius_da
+
+        def cnt_xy(max_val, w): return (int(max_val) + 1) // w + 1
+        bx = cnt_xy(int(boxes.xcenters.max()), xwidth)
+        by = cnt_xy(int(boxes.ycenters.max()), ywidth)
+        mz_hi_range = float((boxes.mz + boxes.mz_radius_da).max()) - boxes.mz_offset
+        bz = int(mz_hi_range / zwidth) + 2
+
+        cells = np.zeros((bx, by, bz + 1), dtype=np.int64)
+        stream_cells_3d(
+            boxes.xcenters, boxes.ycenters, boxes.mz, boxes.xscales, boxes.yscales,
+            boxes.mz_radius_da, boxes.mz_offset, boxes.xmult, boxes.ymult,
+            xwidth, ywidth, zwidth,
+            cells, boxes.order, batch_size, _count_proc_3d, None, cells,
+        )
+        total = inplace_start_pos(cells.ravel())
+        nb_box_idxs = np.empty(total, dtype=np.int64)
+        cursors = np.zeros_like(cells)
+        stream_cells_3d(
+            boxes.xcenters, boxes.ycenters, boxes.mz, boxes.xscales, boxes.yscales,
+            boxes.mz_radius_da, boxes.mz_offset, boxes.xmult, boxes.ymult,
+            xwidth, ywidth, zwidth,
+            cells, boxes.order, batch_size, _fill_proc_3d, None, cells, nb_box_idxs, cursors,
+        )
+        return cls(cells, nb_box_idxs, boxes, xwidth, ywidth, zwidth)
+
+    def query(self, query_boxes: Boxes3D, processor, *processor_args, batch_size: int = 64, progress=None):
+        """Call processor(n, k, *processor_args) for every (query n, indexed k) intersecting pair.
+        Each pair visited exactly once via 3D canonical-cell rule."""
+        stream_cells_3d_parallel(
+            query_boxes.xcenters, query_boxes.ycenters, query_boxes.mz,
+            query_boxes.xscales, query_boxes.yscales,
+            query_boxes.mz_radius_da, query_boxes.mz_offset,
+            self.boxes.xmult, self.boxes.ymult,
+            self.xwidth, self.ywidth, self.zwidth,
+            self.cells, query_boxes.order, batch_size,
+            _visit_proc_3d, progress,
+            self.cells, self.nb_box_idxs,
+            self.boxes.xcenters, self.boxes.ycenters, self.boxes.mz,
+            self.boxes.xscales, self.boxes.yscales,
+            self.boxes.mz_radius_da, self.boxes.mz_offset,
+            self.boxes.xmult, self.boxes.ymult,
+            self.xwidth, self.ywidth, self.zwidth,
+            processor, *processor_args,
+        )
+
+
 PLOT = False
 if __name__ == "__main__":
     precursors_path = Path(
@@ -348,21 +541,42 @@ if __name__ == "__main__":
     counts3d = np.zeros(N, dtype=np.int64)
     with ProgressBar(total=N, desc="count 3D intersections") as progress:
         frame_scan_grid_idx.query(
-            frame_scan_boxes, count_3d_intersections,
+            frame_scan_boxes, count_3d_intersections(Geometry.BOX),
             counts3d, frame_scan_boxes.xcenters, frame_scan_boxes.ycenters, frame_scan_boxes.xscales, frame_scan_boxes.yscales, frame_scan_boxes.xmult, frame_scan_boxes.ymult,
-            data.mz, mz_radius_da, Geometry.BOX,
+            data.mz, mz_radius_da,
             progress=progress,
         )
     print("3D intersection counts:", counts3d[:10])
 
+    frame_scan_mz_boxes = Boxes3D(
+        xcenters=data.frame, ycenters=data.scan, mz=data.mz,
+        xscales=data.frame_scale, yscales=data.scan_scale,
+        mz_radius_da=mz_radius_da,
+        xmult=cfg.frame_mult, ymult=cfg.scan_mult,
+    )
+    with ProgressBar(total=N, desc="build 3D index") as progress:
+        frame_scan_mz_grid_idx = GridIndex3D.from_boxes(frame_scan_mz_boxes, progress=progress)
 
+    counts3d_v2 = np.zeros(N, dtype=np.int64)
+    with ProgressBar(total=N, desc="count intersections (3D grid)") as progress:
+        frame_scan_mz_grid_idx.query(
+            frame_scan_mz_boxes, count_3d_intersections(Geometry.BOX),
+            counts3d_v2,
+            frame_scan_mz_boxes.xcenters, frame_scan_mz_boxes.ycenters,
+            frame_scan_mz_boxes.xscales, frame_scan_mz_boxes.yscales,
+            frame_scan_mz_boxes.xmult, frame_scan_mz_boxes.ymult,
+            data.mz, mz_radius_da,
+            progress=progress,
+        )
+    print("3D grid counts:", counts3d_v2[:10])
+    print("Match 2D-grid vs 3D-grid:", np.array_equal(counts3d, counts3d_v2))
 
     counts3dcyl = np.zeros(N, dtype=np.int64)
     with ProgressBar(total=N, desc="count 3D intersections") as progress:
         frame_scan_grid_idx.query(
-            frame_scan_boxes, count_3d_intersections,
+            frame_scan_boxes, count_3d_intersections(Geometry.CYLINDER),
             counts3dcyl, frame_scan_boxes.xcenters, frame_scan_boxes.ycenters, frame_scan_boxes.xscales, frame_scan_boxes.yscales, frame_scan_boxes.xmult, frame_scan_boxes.ymult,
-            data.mz, mz_radius_da, Geometry.CYLINDER,
+            data.mz, mz_radius_da,
             progress=progress,
         )
     print("3D cylinder intersection counts:", counts3dcyl[:10])
@@ -370,7 +584,7 @@ if __name__ == "__main__":
     from timstofu.stats import count1D
     from timstofu.plotting import plot_counts
 
-    plot_counts(count1D(counts), xlog=False, ylog=False)
+    # plot_counts(count1D(counts), xlog=False, ylog=False)
     # The problem
 
     # F9477 -
