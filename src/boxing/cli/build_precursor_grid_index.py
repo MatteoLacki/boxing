@@ -27,10 +27,11 @@ _REQUIRED_COLUMNS = {
 }
 
 
-def validate_config(config_path: Path) -> object:
+def validate_config(config_path: Path | None, overrides: dict | None = None) -> object:
     return _validate_precursor_neighbors_config(
         config_path,
         require_cpp_backend_compat=True,
+        overrides=overrides,
     )
 
 
@@ -38,9 +39,10 @@ def build(
     precursors_path: Path,
     dataset_path: Path,
     output_dir: Path,
-    config_path: Path,
+    config_path: Path | None,
+    overrides: dict | None = None,
 ) -> None:
-    cfg = validate_config(config_path)
+    cfg = validate_config(config_path, overrides)
     prec = read_df(precursors_path)
 
     missing = _REQUIRED_COLUMNS - set(prec.columns)
@@ -126,9 +128,21 @@ def main() -> None:
     parser.add_argument("precursors_path", type=Path)
     parser.add_argument("dataset_path", type=Path)
     parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--config", type=Path, default=None, help="Path to TOML config (optional).")
+    parser.add_argument("--frame-mult", type=float, default=None)
+    parser.add_argument("--scan-mult", type=float, default=None)
+    parser.add_argument("--frame-inner-mult", type=float, default=None)
+    parser.add_argument("--scan-inner-mult", type=float, default=None)
+    parser.add_argument("--mz-inner-radius-da", type=float, default=None)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--geometry", type=str, default=None)
     args = parser.parse_args()
-    build(args.precursors_path, args.dataset_path, args.output_dir, args.config)
+    overrides = dict(
+        frame_mult=args.frame_mult, scan_mult=args.scan_mult,
+        frame_inner_mult=args.frame_inner_mult, scan_inner_mult=args.scan_inner_mult,
+        mz_inner_radius_da=args.mz_inner_radius_da, top_k=args.top_k, geometry=args.geometry,
+    )
+    build(args.precursors_path, args.dataset_path, args.output_dir, args.config, overrides)
 
 
 if __name__ == "__main__":

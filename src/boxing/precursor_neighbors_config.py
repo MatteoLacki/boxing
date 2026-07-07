@@ -30,25 +30,27 @@ def validate_config(
     config_path: Path | None,
     *,
     require_cpp_backend_compat: bool = False,
+    overrides: dict | None = None,
 ) -> PrecursorNeighborsConfig:
     if config_path is None:
-        cfg = PrecursorNeighborsConfig()
+        raw = {}
     else:
         with open(config_path, "rb") as f:
             raw = tomllib.load(f)
         raw = raw.get("precursor_neighbors", raw)
-        try:
-            cfg = PrecursorNeighborsConfig(**raw)
-        except ValidationError as exc:
-            lines = [f"Config error in {config_path} [precursor_neighbors]:"]
-            for err in exc.errors():
-                loc = (
-                    " -> ".join(str(p) for p in err["loc"])
-                    if err["loc"]
-                    else "(top level)"
-                )
-                lines.append(f"  {loc}: {err['msg']}")
-            raise ValueError("\n".join(lines)) from exc
+    raw = {**raw, **{k: v for k, v in (overrides or {}).items() if v is not None}}
+    try:
+        cfg = PrecursorNeighborsConfig(**raw)
+    except ValidationError as exc:
+        lines = [f"Config error in {config_path} [precursor_neighbors]:"]
+        for err in exc.errors():
+            loc = (
+                " -> ".join(str(p) for p in err["loc"])
+                if err["loc"]
+                else "(top level)"
+            )
+            lines.append(f"  {loc}: {err['msg']}")
+        raise ValueError("\n".join(lines)) from exc
 
     if require_cpp_backend_compat and cfg.cylinder_radius != 1.0:
         raise ValueError(
