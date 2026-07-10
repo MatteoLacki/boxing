@@ -44,27 +44,15 @@ def format_cpp_args(params: dict[str, float | int | str]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("config_path", type=Path, nargs="?", default=None, help="Path to TOML config (optional).")
+    parser.add_argument("config_path", type=Path, help="Path to TOML config.")
     parser.add_argument("dataset_path", type=Path)
     parser.add_argument(
         "--json",
         action="store_true",
         help="Emit raw parameters as JSON instead of C++ command-line flags.",
     )
-    parser.add_argument("--frame-mult", type=float, default=None)
-    parser.add_argument("--scan-mult", type=float, default=None)
-    parser.add_argument("--frame-inner-mult", type=float, default=None)
-    parser.add_argument("--scan-inner-mult", type=float, default=None)
-    parser.add_argument("--mz-inner-radius-da", type=float, default=None)
-    parser.add_argument("--top-k", type=int, default=None)
-    parser.add_argument("--geometry", type=str, default=None)
     args = parser.parse_args()
-    overrides = dict(
-        frame_mult=args.frame_mult, scan_mult=args.scan_mult,
-        frame_inner_mult=args.frame_inner_mult, scan_inner_mult=args.scan_inner_mult,
-        mz_inner_radius_da=args.mz_inner_radius_da, top_k=args.top_k, geometry=args.geometry,
-    )
-    params = get_params(args.config_path, args.dataset_path, overrides)
+    params = get_params(args.config_path, args.dataset_path)
     if args.json:
         print(json.dumps(params, sort_keys=True))
     else:
