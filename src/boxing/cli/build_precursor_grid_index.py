@@ -51,7 +51,7 @@ def build(
             f"{precursors_path}: missing required columns: {sorted(missing)}"
         )
 
-    output_dir.mkdir(parents=True, exist_ok=False)
+    output_dir.mkdir(parents=True, exist_ok=True)
     mz_radius_da = read_outer_mz_radius_da(dataset_path)
 
     boxes3d = Boxes3D(
