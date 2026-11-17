@@ -1,5 +1,9 @@
 # CLAUDE.md — boxing
 
+History lives in `AI_CHANGELOG.md` (append-only; read it for *why* something changed).
+This file is present tense: a change rewrites its sentence here and appends an entry
+there, in the same commit.
+
 ## Package layout
 
 ```
